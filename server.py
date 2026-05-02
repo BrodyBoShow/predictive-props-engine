@@ -16,6 +16,7 @@ import pandas as pd
 import time
 import logging
 import threading
+import json
 
 SERVER_VERSION = "v5.3-multivar"  # 12-factor + 4-day schedule lookahead
 
@@ -1535,27 +1536,70 @@ def get_version():
 
 @app.route("/api/debug-schedule")
 def debug_schedule():
-    """Diagnostic: fetch raw NBA scoreboard data for next 5 days and report."""
+    """Diagnostic: try MULTIPLE schedule endpoints and report what they return."""
     from nba_api.stats.endpoints import scoreboard as stats_sb
     ET = timezone(timedelta(hours=-4))
     now_et = datetime.now(ET)
-    out = {}
-    for offset in range(0, 6):
+    out = {"by_date_scoreboardv2": {}, "endpoints_tried": []}
+
+    # 1. ScoreBoardV2 (stats.endpoints.scoreboard) — the one we currently use
+    out["endpoints_tried"].append("nba_api.stats.endpoints.scoreboard.ScoreBoard")
+    for offset in range(0, 8):
         date = now_et + timedelta(days=offset)
-        date_str = date.strftime("%m/%d/%Y")
+        ds = date.strftime("%m/%d/%Y")
         try:
-            sb = stats_sb.ScoreBoard(game_date=date_str, league_id="00")
+            sb = stats_sb.ScoreBoard(game_date=ds, league_id="00")
             hdr = sb.game_header.get_data_frame()
-            ls  = sb.line_score.get_data_frame()
-            out[date_str] = {
-                "label":       date.strftime("%a %b %d"),
-                "header_rows": len(hdr) if hdr is not None else 0,
-                "line_rows":   len(ls)  if ls  is not None else 0,
-                "header_cols": hdr.columns.tolist()[:8] if hdr is not None and not hdr.empty else [],
-                "sample":      hdr.iloc[0].to_dict() if hdr is not None and not hdr.empty else {},
+            rows = int(len(hdr)) if hdr is not None else 0
+            cols = hdr.columns.tolist()[:6] if hdr is not None and not hdr.empty else []
+            sample = {}
+            if hdr is not None and not hdr.empty:
+                # Convert to JSON-safe dict (drop NaN/Timestamp)
+                raw = hdr.iloc[0].to_dict()
+                for k, v in raw.items():
+                    try:
+                        json.dumps(v)
+                        sample[k] = v
+                    except Exception:
+                        sample[k] = str(v)
+            out["by_date_scoreboardv2"][ds] = {
+                "label": date.strftime("%a %b %d"),
+                "rows": rows, "cols": cols, "sample_keys": list(sample.keys())[:10],
             }
         except Exception as e:
-            out[date_str] = {"error": str(e), "label": date.strftime("%a %b %d")}
+            out["by_date_scoreboardv2"][ds] = {"error": str(e), "label": date.strftime("%a %b %d")}
+
+    # 2. Try ScheduleLeagueV2 (the actual schedule API)
+    try:
+        from nba_api.stats.endpoints import scheduleleaguev2
+        out["endpoints_tried"].append("scheduleleaguev2")
+        sched = scheduleleaguev2.ScheduleLeagueV2(season=SEASON, league_id="00")
+        dfs = sched.get_data_frames()
+        out["scheduleleaguev2"] = {
+            "frame_count": len(dfs),
+            "frames": [{"rows": len(df), "cols": df.columns.tolist()[:10]} for df in dfs[:3]],
+        }
+    except ImportError:
+        out["scheduleleaguev2"] = "module not available in nba_api version"
+    except Exception as e:
+        out["scheduleleaguev2"] = {"error": str(e), "type": type(e).__name__}
+
+    # 3. Try scheduleleaguev2int
+    try:
+        import json as json_lib
+        from nba_api.stats.endpoints import scheduleleaguev2int
+        out["endpoints_tried"].append("scheduleleaguev2int")
+        sched = scheduleleaguev2int.ScheduleLeagueV2Int(season=SEASON, league_id="00")
+        dfs = sched.get_data_frames()
+        out["scheduleleaguev2int"] = {
+            "frame_count": len(dfs),
+            "frames": [{"rows": len(df), "cols": df.columns.tolist()[:10]} for df in dfs[:3]],
+        }
+    except ImportError:
+        out["scheduleleaguev2int"] = "module not available"
+    except Exception as e:
+        out["scheduleleaguev2int"] = {"error": str(e), "type": type(e).__name__}
+
     return jsonify(out)
 
 
