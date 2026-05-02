@@ -901,15 +901,18 @@ def post_project():
     matchup_pct = 0.0
     if prop_type in ("points", "pra", "pa", "pr", "three_pointers") and opp_delta:
         deff_delta = float(opp_delta.get("dEFF_delta") or 0)
-        gp         = int(opp_delta.get("gp") or 0)
-        if gp >= 3 and abs(deff_delta) >= 0.5:
-            matchup_pct    = min(_MATCHUP_CAP, max(-_MATCHUP_CAP, deff_delta * _MATCHUP_SCALE))
-            matchup_abs    = round(corr * matchup_pct, 2)
-            trend          = "SOFTENING" if deff_delta > 0 else "TIGHTENING"
+        # gp check removed — matchup delta now computed vs league avg (season-long),
+        # not rolling L5, so gp is not meaningful as a quality gate.
+        if abs(deff_delta) >= 0.5:
+            matchup_pct = min(_MATCHUP_CAP, max(-_MATCHUP_CAP, deff_delta * _MATCHUP_SCALE))
+            matchup_abs = round(corr * matchup_pct, 2)
+            direction   = "above" if deff_delta > 0 else "below"
+            quality     = "SOFT" if deff_delta > 0 else "ELITE"
             drivers.append(
-                f"Matchup Delta — {opp_abbr} defense {trend} "
-                f"(L5 dEFF {opp_delta.get('l5_dEFF', '?')} vs season {opp_delta.get('season_dEFF', '?')}, "
-                f"Δ={deff_delta:+.1f} pts). "
+                f"Matchup Quality — {opp_abbr} defense is {quality} "
+                f"({opp_delta.get('l5_dEFF', '?'):.1f} dEFF, "
+                f"{abs(deff_delta):.1f} pts {direction} league avg of "
+                f"{opp_delta.get('season_dEFF', '?'):.1f}). "
                 f"Impact: {matchup_pct*100:+.1f}% ({matchup_abs:+.2f} pts)."
             )
     breakdown["matchupAdj"] = round(matchup_pct * 100, 2)
@@ -1134,6 +1137,23 @@ def get_schedule():
 @app.route("/api/version")
 def get_version():
     return {"version": SERVER_VERSION, "ready": _warmup_done.is_set()}
+
+
+@app.route("/api/debug-team-defense")
+def debug_team_defense():
+    """Diagnostic: fetch raw LeagueDashPtTeamDefend and return actual columns + sample row."""
+    out = {}
+    for cat in ("3 Pointers", "Less Than 6Ft"):
+        try:
+            df = leaguedashptteamdefend.LeagueDashPtTeamDefend(
+                season=SEASON, season_type_all_star="Playoffs",
+                defense_category=cat, per_mode_simple="PerGame",
+            ).get_data_frames()[0]
+            sample = df.iloc[0].to_dict() if not df.empty else {}
+            out[cat] = {"rows": len(df), "cols": df.columns.tolist(), "sample": sample}
+        except Exception as e:
+            out[cat] = {"error": str(e)}
+    return jsonify(out)
 
 
 @app.route("/api/debug-teams")
