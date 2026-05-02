@@ -17,7 +17,7 @@ import time
 import logging
 import threading
 
-SERVER_VERSION = "v5.0-multivar"  # 10-factor correlation engine
+SERVER_VERSION = "v5.1-multivar"  # 10-factor + bulletproof schedule
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1246,43 +1246,67 @@ def _fmt_series(home_wins: int, away_wins: int, home_abbr: str, away_abbr: str) 
     return f"{leader} leads {max(home_wins, away_wins)}-{min(home_wins, away_wins)}"
 
 
-def _fetch_date_games(date_str: str) -> list:
+def _fetch_date_games(date_str):
     """
     Fetch scheduled NBA games for a specific date using stats scoreboard.
     Returns list of game dicts with rosters auto-populated from players cache.
-    date_str format: 'MM/DD/YYYY'
+    date_str format: 'MM/DD/YYYY'. Returns [] safely on any error.
     """
-    from nba_api.stats.endpoints import scoreboard as stats_sb
     try:
-        sb   = stats_sb.ScoreBoard(game_date=date_str, league_id="00")
-        hdr  = sb.game_header.get_data_frame()
-        ls   = sb.line_score.get_data_frame()
-        ser  = sb.series_standings.get_data_frame() if hasattr(sb, "series_standings") else None
+        from nba_api.stats.endpoints import scoreboard as stats_sb
+        sb  = stats_sb.ScoreBoard(game_date=date_str, league_id="00")
+        hdr = sb.game_header.get_data_frame()
+        ls  = sb.line_score.get_data_frame()
+    except Exception as e:
+        logging.warning("Stats scoreboard fetch failed for %s: %s", date_str, e)
+        return []
 
-        ser_idx = {}
-        if ser is not None and not ser.empty:
+    # Series standings is optional and often missing/malformed
+    ser_idx = {}
+    try:
+        ser = sb.series_standings.get_data_frame() if hasattr(sb, "series_standings") else None
+        if ser is not None and not ser.empty and "GAME_ID" in ser.columns:
             ser_idx = ser.set_index("GAME_ID").to_dict("index")
+    except Exception as e:
+        logging.warning("Series standings parse failed for %s: %s", date_str, e)
 
-        games = []
-        for _, row in hdr.iterrows():
-            gid     = str(row.get("GAME_ID", ""))
-            home_id = int(row.get("HOME_TEAM_ID", 0))
-            away_id = int(row.get("VISITOR_TEAM_ID", 0))
-            home_ls = ls[ls["TEAM_ID"] == home_id]
-            away_ls = ls[ls["TEAM_ID"] == away_id]
+    if hdr is None or hdr.empty:
+        return []
 
-            home = str(home_ls["TEAM_ABBREVIATION"].values[0]) if not home_ls.empty else ""
-            away = str(away_ls["TEAM_ABBREVIATION"].values[0]) if not away_ls.empty else ""
-            home_full = str(home_ls["TEAM_CITY_NAME"].values[0] + " " + home_ls["TEAM_NICKNAME"].values[0]) if not home_ls.empty else home
-            away_full = str(away_ls["TEAM_CITY_NAME"].values[0] + " " + away_ls["TEAM_NICKNAME"].values[0]) if not away_ls.empty else away
+    games = []
+    for _, row in hdr.iterrows():
+        try:
+            gid     = str(row.get("GAME_ID", "") or "")
+            home_id = int(row.get("HOME_TEAM_ID") or 0)
+            away_id = int(row.get("VISITOR_TEAM_ID") or 0)
 
-            s = ser_idx.get(gid, {})
-            home_w = int(s.get("HOME_TEAM_WINS", 0))
-            away_w = int(s.get("VISITOR_TEAM_WINS", 0))
+            # Resolve abbr from line_score; fall back to static lookup if missing
+            home_ls = ls[ls["TEAM_ID"] == home_id] if (ls is not None and not ls.empty) else None
+            away_ls = ls[ls["TEAM_ID"] == away_id] if (ls is not None and not ls.empty) else None
+
+            def _safe_get(df, col):
+                try:
+                    return str(df[col].values[0]) if df is not None and not df.empty and col in df.columns else ""
+                except Exception:
+                    return ""
+
+            home = _safe_get(home_ls, "TEAM_ABBREVIATION") or _TEAM_ID_TO_ABBR.get(home_id, "")
+            away = _safe_get(away_ls, "TEAM_ABBREVIATION") or _TEAM_ID_TO_ABBR.get(away_id, "")
+
+            home_city = _safe_get(home_ls, "TEAM_CITY_NAME")
+            home_nick = _safe_get(home_ls, "TEAM_NICKNAME")
+            away_city = _safe_get(away_ls, "TEAM_CITY_NAME")
+            away_nick = _safe_get(away_ls, "TEAM_NICKNAME")
+            home_full = (home_city + " " + home_nick).strip() or home
+            away_full = (away_city + " " + away_nick).strip() or away
+
+            s = ser_idx.get(gid, {}) or {}
+            home_w = int(s.get("HOME_TEAM_WINS") or 0)
+            away_w = int(s.get("VISITOR_TEAM_WINS") or 0)
             game_num = home_w + away_w + 1
             series_str = _fmt_series(home_w, away_w, home, away) if (home_w or away_w) else ""
 
-            status = str(row.get("GAME_STATUS_TEXT", "TBD")).strip()
+            status = str(row.get("GAME_STATUS_TEXT") or "TBD").strip()
 
             entry = {
                 "id":        gid,
@@ -1291,67 +1315,101 @@ def _fetch_date_games(date_str: str) -> list:
                 "homeTeam":  home_full,
                 "awayTeam":  away_full,
                 "time":      status,
-                "title":     f"Game {game_num}",
+                "title":     f"Game {game_num}" if game_num <= 7 else "Playoff Game",
                 "series":    series_str,
                 "restDays":  {},
             }
             if home: entry[home] = _roster_for_team(home)
             if away: entry[away] = _roster_for_team(away)
             games.append(entry)
+        except Exception as e:
+            logging.warning("Skipping malformed scheduled game: %s", e)
+            continue
 
-        return games
-    except Exception as e:
-        logging.warning("Stats scoreboard fetch failed for %s: %s", date_str, e)
-        return []
+    return games
 
 
 @app.route("/api/schedule")
 def get_schedule():
-    ET = timezone(timedelta(hours=-4))   # EDT (Apr–Oct)
-    now_et = datetime.now(ET)
+    """
+    Returns today's games (from live scoreboard) + tomorrow's scheduled games.
+    Always returns 200 with safe empty arrays if NBA APIs fail — never crashes
+    the frontend, which depends on this for game selection.
+    """
+    try:
+        ET = timezone(timedelta(hours=-4))   # EDT (Apr–Oct)
+        now_et = datetime.now(ET)
+        today_label    = now_et.strftime(f"%b {now_et.day}, %Y")
+        tomorrow_et    = now_et + timedelta(days=1)
+        tomorrow_label = tomorrow_et.strftime(f"%b {tomorrow_et.day}")
+        today_str      = now_et.strftime("%m/%d/%Y")
+        tomorrow_str   = tomorrow_et.strftime("%m/%d/%Y")
+    except Exception as e:
+        logging.error("Schedule date computation failed: %s", e)
+        return jsonify({
+            "success": True, "today": "Today", "upcomingLabel": "Tomorrow",
+            "games": [], "todayGames": [], "upcomingGames": [],
+        })
 
-    today_label    = now_et.strftime(f"%b {now_et.day}, %Y")          # e.g. "May 1, 2026"
-    tomorrow_et    = now_et + timedelta(days=1)
-    tomorrow_label = tomorrow_et.strftime(f"%b {tomorrow_et.day}")    # e.g. "May 2"
-    tomorrow_str   = tomorrow_et.strftime("%m/%d/%Y")                  # e.g. "05/02/2026"
-
-    # ── Today: live scoreboard (real-time scores + status) ───────────────────
+    # ── Today: try live scoreboard first ───────────────────────────────────
     today_games = []
     try:
         board = live_scoreboard.ScoreBoard()
-        for g in board.games.get_dict():
-            away = g.get("awayTeam", {})
-            home = g.get("homeTeam", {})
-            home_abbr = home.get("teamTricode", "")
-            away_abbr = away.get("teamTricode", "")
-            entry = {
-                "id":        g.get("gameId"),
-                "away":      away_abbr,
-                "home":      home_abbr,
-                "awayTeam":  away.get("teamName", ""),
-                "homeTeam":  home.get("teamName", ""),
-                "time":      g.get("gameStatusText", ""),
-                "title":     "Playoff Game",
-                "series":    "",
-                "restDays":  {},
-                "awayScore": away.get("score"),
-                "homeScore": home.get("score"),
-                "period":    g.get("period"),
-            }
-            if home_abbr: entry[home_abbr] = _roster_for_team(home_abbr)
-            if away_abbr: entry[away_abbr] = _roster_for_team(away_abbr)
-            today_games.append(entry)
+        try:
+            game_dicts = board.games.get_dict()
+        except Exception:
+            game_dicts = []
+        for g in (game_dicts or []):
+            try:
+                away = g.get("awayTeam") or {}
+                home = g.get("homeTeam") or {}
+                home_abbr = home.get("teamTricode") or ""
+                away_abbr = away.get("teamTricode") or ""
+                entry = {
+                    "id":        g.get("gameId") or "",
+                    "away":      away_abbr,
+                    "home":      home_abbr,
+                    "awayTeam":  away.get("teamName") or away_abbr,
+                    "homeTeam":  home.get("teamName") or home_abbr,
+                    "time":      g.get("gameStatusText") or "TBD",
+                    "title":     "Playoff Game",
+                    "series":    "",
+                    "restDays":  {},
+                    "awayScore": away.get("score"),
+                    "homeScore": home.get("score"),
+                    "period":    g.get("period"),
+                }
+                if home_abbr: entry[home_abbr] = _roster_for_team(home_abbr)
+                if away_abbr: entry[away_abbr] = _roster_for_team(away_abbr)
+                today_games.append(entry)
+            except Exception as e:
+                logging.warning("Skipping malformed live game: %s", e)
+                continue
     except Exception as e:
         logging.error("Live scoreboard error: %s", e)
 
+    # ── If live scoreboard returned nothing, try stats scoreboard for today ──
+    if not today_games:
+        try:
+            today_games = _fetch_date_games(today_str)
+        except Exception as e:
+            logging.warning("Today stats scoreboard fallback failed: %s", e)
+            today_games = []
+
     # ── Tomorrow: stats scoreboard (scheduled games) ─────────────────────────
-    tomorrow_games = _fetch_date_games(tomorrow_str)
+    try:
+        tomorrow_games = _fetch_date_games(tomorrow_str)
+    except Exception as e:
+        logging.warning("Tomorrow stats scoreboard failed: %s", e)
+        tomorrow_games = []
 
     return jsonify({
         "success":       True,
         "today":         today_label,
+        "todayDate":     today_str,
         "upcomingLabel": tomorrow_label,
-        "games":         today_games,       # backward compat
+        "upcomingDate":  tomorrow_str,
+        "games":         today_games,
         "todayGames":    today_games,
         "upcomingGames": tomorrow_games,
     })
