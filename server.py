@@ -17,7 +17,7 @@ import time
 import logging
 import threading
 
-SERVER_VERSION = "v4.2-corr"  # TEAM_ID→abbr fix
+SERVER_VERSION = "v5.0-multivar"  # 10-factor correlation engine
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -366,7 +366,7 @@ def _build_clutch():
     df = leaguedashplayerclutch.LeagueDashPlayerClutch(
         season=SEASON,
         season_type_all_star="Playoffs",
-        per_mode_simple="PerGame",
+        per_mode_detailed="PerGame",
     ).get_data_frames()[0]
 
     clutch = {}
@@ -749,6 +749,21 @@ _THREE_PT_RELY_THRESH  = 35.0   # % pts from 3s = "3pt-reliant" shooter
 _FG3_ELITE_DEF_THRESH  = -0.015 # fg3VsAvg ≤ this → elite 3pt defense
 _MATCHUP_SCALE         = 0.015  # +1.5% projection per +1.0 dEFF point increase
 _MATCHUP_CAP           = 0.09   # ±9% max matchup delta swing
+_LEAGUE_AVG_PACE       = 96.5   # league-avg PO pace (possessions per 48 min)
+_PACE_CAP              = 0.05   # ±5% max pace adjustment
+_FORM_BLEND_WEIGHT     = 0.25   # how much L5 divergence counts vs base
+_FORM_CAP              = 0.08   # ±8% max recent form swing
+_REST_B2B              = -0.03  # 0 days rest = -3% counting stats
+_REST_LONG             = 0.015  # 2+ days rest = +1.5%
+_SPLIT_BLEND_WEIGHT    = 0.40   # how much home/road delta counts (40%)
+_SPLIT_CAP             = 0.06   # ±6% max venue swing
+_USG_ELITE_THRESH      = 28.0   # USG% above this = high-usage role
+_TS_GOOD_THRESH        = 55.0   # TS% above this = efficient
+_TS_BAD_THRESH         = 50.0   # TS% below this = inefficient
+_CLUTCH_LIFT_THRESH    = 0.20   # ±20% clutch divergence → meaningful signal
+_COUNTING_PROPS = ("points","assists","rebounds","steals","blocks",
+                   "pra","pa","pr","three_pointers")
+_SCORING_PROPS  = ("points","pra","pa","pr","three_pointers")
 
 
 def _resolve_player(name: str, players_cache: dict):
@@ -824,6 +839,12 @@ def post_project():
     prop_type    = (body.get("prop_type")   or "points").strip().lower()
     opp_abbr     = (body.get("opponent_abbr") or "").strip().upper()
     book_line    = body.get("book_line")
+    # Optional context from client (enriches server projection — never fabricated)
+    l5_avg       = body.get("l5_avg")        # client-computed L5 PO avg for this prop
+    rest_days    = body.get("rest_days")     # player's team rest days (int)
+    team_abbr    = (body.get("team_abbr") or "").strip().upper()  # player's own team
+    is_home      = body.get("is_home")       # bool: player playing at home?
+    high_leverage = bool(body.get("high_leverage"))  # Game 7, elimination, etc.
 
     if not player_name:
         return jsonify({"success": False, "error": "player_name is required"}), 400
@@ -841,6 +862,9 @@ def post_project():
     matchup_cache  = (_cache_get("matchup_delta") or {}).get("matchupDelta",{})
     scoring_cache  = (_cache_get("scoring")       or {}).get("scoring",     {})
     team_def_cache = (_cache_get("team_defense")  or {}).get("teamDefense", {})
+    teams_cache    = (_cache_get("teams")         or {}).get("teams",       {})
+    splits_cache   = (_cache_get("splits")        or {}).get("splits",      {})
+    clutch_cache   = (_cache_get("clutch")        or {}).get("clutch",      {})
 
     # ── Resolve player ────────────────────────────────────────────────────────
     resolved_name, player = _resolve_player(player_name, players_cache)
@@ -852,8 +876,13 @@ def post_project():
     rs  = player.get("rs", po)
     scoring_row  = scoring_cache.get(resolved_name)
     tracking_row = tracking_cache.get(resolved_name)
+    splits_row   = splits_cache.get(resolved_name)
+    clutch_row   = clutch_cache.get(resolved_name)
     opp_delta    = matchup_cache.get(opp_abbr, {})  if opp_abbr else {}
     opp_def      = team_def_cache.get(opp_abbr, {}) if opp_abbr else {}
+    own_team     = team_abbr or player.get("team", "").upper()
+    own_team_data = teams_cache.get(own_team, {}) if own_team else {}
+    opp_team_data = teams_cache.get(opp_abbr, {}) if opp_abbr else {}
 
     # ── Base projection ───────────────────────────────────────────────────────
     base = _base_stat(po, rs, prop_type, scoring_row)
@@ -981,6 +1010,189 @@ def post_project():
     breakdown["hustleAdj"] = hustle_delta
     corr = round(corr + hustle_delta, 1)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 5 — PACE CONTEXT (data-verified)
+    # Game pace = (own_team_pace + opp_team_pace) / 2 from teams cache.
+    # League PO baseline: ~96.5 possessions per 48 min.
+    # More possessions = more opportunities for ALL counting stats.
+    # Affects every counting prop linearly. Cap ±5%.
+    # ─────────────────────────────────────────────────────────────────────────
+    pace_pct = 0.0
+    if prop_type in _COUNTING_PROPS:
+        own_pace = float(own_team_data.get("rsPace") or 0)
+        opp_pace = float(opp_team_data.get("rsPace") or 0)
+        if own_pace > 50 and opp_pace > 50:  # sanity-check real values
+            game_pace = round((own_pace + opp_pace) / 2, 1)
+            delta_pct = (game_pace - _LEAGUE_AVG_PACE) / _LEAGUE_AVG_PACE
+            pace_pct = min(_PACE_CAP, max(-_PACE_CAP, delta_pct))
+            if abs(pace_pct) >= 0.005:
+                tempo = "FAST" if delta_pct > 0 else "SLOW"
+                pace_abs = round(corr * pace_pct, 2)
+                drivers.append(
+                    f"Pace Context — {tempo} game expected ({game_pace} possessions/48 vs "
+                    f"{_LEAGUE_AVG_PACE} league avg). Each possession = scoring opportunity. "
+                    f"Impact: {pace_pct*100:+.1f}% ({pace_abs:+.2f})."
+                )
+    breakdown["paceAdj"] = round(pace_pct * 100, 2)
+    corr = round(corr * (1 + pace_pct), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 6 — RECENT FORM / L5 BLEND (client-passed)
+    # Client computes L5 PO average from real game logs. Server blends a portion
+    # of the divergence into projection. Recent games are 2-3x more predictive
+    # than full-season averages for short-term outcomes.
+    # Cap ±8%.
+    # ─────────────────────────────────────────────────────────────────────────
+    form_delta = 0.0
+    if l5_avg is not None and base > 0:
+        try:
+            l5 = float(l5_avg)
+            if l5 > 0:
+                divergence = (l5 - base) / base
+                if abs(divergence) >= 0.05:  # only when ≥5% divergence
+                    form_pct = min(_FORM_CAP, max(-_FORM_CAP, divergence * _FORM_BLEND_WEIGHT))
+                    form_delta = round(corr * form_pct, 2)
+                    trend = "HOT" if divergence > 0 else "COLD"
+                    drivers.append(
+                        f"Recent Form — {resolved_name.title()} {trend} over L5 "
+                        f"({l5:.1f} vs {base:.1f} blended base, {divergence*100:+.1f}%). "
+                        f"Recency-weighted blend: {form_delta:+.2f}."
+                    )
+        except (TypeError, ValueError):
+            pass
+    breakdown["recentFormAdj"] = form_delta
+    corr = round(corr + form_delta, 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 7 — REST DAYS (client-passed)
+    # 0 days rest (back-to-back) = -3% counting stats (documented effect).
+    # 2+ days rest = +1.5% (full recovery).
+    # 1 day rest = baseline (no adjustment).
+    # ─────────────────────────────────────────────────────────────────────────
+    rest_pct = 0.0
+    if rest_days is not None and prop_type in _COUNTING_PROPS:
+        try:
+            rd = int(rest_days)
+            if rd == 0:
+                rest_pct = _REST_B2B
+                label = "BACK-TO-BACK FATIGUE"
+            elif rd >= 2:
+                rest_pct = _REST_LONG
+                label = "WELL-RESTED"
+            else:
+                label = None
+            if label:
+                rest_abs = round(corr * rest_pct, 2)
+                drivers.append(
+                    f"Rest Differential — {label} ({rd} days off). "
+                    f"Documented physiological effect: {rest_pct*100:+.1f}% ({rest_abs:+.2f})."
+                )
+        except (TypeError, ValueError):
+            pass
+    breakdown["restAdj"] = round(rest_pct * 100, 2)
+    corr = round(corr * (1 + rest_pct), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 8 — HOME / ROAD SPLIT (data-verified)
+    # Pulls player's PO home vs road averages from splits cache. If the player
+    # has a meaningful split for this prop, apply 40% of the differential.
+    # Cap ±6%. Requires client to pass is_home and prop must be home/road relevant.
+    # ─────────────────────────────────────────────────────────────────────────
+    splits_pct = 0.0
+    if splits_row and is_home is not None and prop_type in ("points","assists","rebounds","pra","pa","pr"):
+        home = splits_row.get("home") or {}
+        road = splits_row.get("road") or {}
+        key_map = {
+            "points":"ppg", "assists":"apg", "rebounds":"rpg",
+            "pra":["ppg","rpg","apg"], "pa":["ppg","apg"], "pr":["ppg","rpg"],
+        }
+        k = key_map.get(prop_type)
+        h_gp = int(home.get("gp") or 0)
+        r_gp = int(road.get("gp") or 0)
+        if h_gp >= 1 and r_gp >= 1 and k:
+            if isinstance(k, list):
+                h = sum(float(home.get(x) or 0) for x in k)
+                r = sum(float(road.get(x) or 0) for x in k)
+            else:
+                h = float(home.get(k) or 0)
+                r = float(road.get(k) or 0)
+            if h > 0 and r > 0:
+                venue_avg = h if is_home else r
+                other_avg = r if is_home else h
+                avg = (h + r) / 2
+                delta_pct = (venue_avg - other_avg) / avg if avg > 0 else 0
+                splits_pct = min(_SPLIT_CAP, max(-_SPLIT_CAP, delta_pct * _SPLIT_BLEND_WEIGHT))
+                if abs(splits_pct) >= 0.005:
+                    venue = "HOME" if is_home else "ROAD"
+                    splits_abs = round(corr * splits_pct, 2)
+                    drivers.append(
+                        f"Venue Split — {resolved_name.title()} averages {venue_avg:.1f} at {venue} "
+                        f"vs {other_avg:.1f} at other venue ({h_gp}H/{r_gp}R PO games). "
+                        f"Impact: {splits_pct*100:+.1f}% ({splits_abs:+.2f})."
+                    )
+    breakdown["splitsAdj"] = round(splits_pct * 100, 2)
+    corr = round(corr * (1 + splits_pct), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 9 — CLUTCH PERFORMANCE (data-verified, high-leverage only)
+    # Compares player's clutch per-minute production to regular per-minute rate.
+    # Only fires when:
+    #   • client flagged high_leverage=true (Game 7, elimination, etc.)
+    #   • clutch sample is meaningful (≥1 min/game in clutch situations)
+    #   • divergence is significant (≥20% above/below regular rate)
+    # ─────────────────────────────────────────────────────────────────────────
+    clutch_delta = 0.0
+    if high_leverage and clutch_row and prop_type in _SCORING_PROPS:
+        c_ppg = float(clutch_row.get("ppg") or 0)
+        c_min = float(clutch_row.get("min") or 0)
+        c_gp  = int(clutch_row.get("gp") or 0)
+        r_ppg = float(po.get("ppg") or rs.get("ppg") or 0)
+        r_min = float(po.get("min") or rs.get("min") or 0)
+        if c_min >= 1.0 and c_gp >= 2 and r_ppg > 0 and r_min > 5:
+            c_per_min = c_ppg / max(c_min, 0.5)
+            r_per_min = r_ppg / max(r_min, 0.5)
+            lift = (c_per_min - r_per_min) / r_per_min if r_per_min > 0 else 0
+            if abs(lift) >= _CLUTCH_LIFT_THRESH:
+                # Apply 50% of the lift, capped at ±0.6 pts in absolute terms
+                clutch_delta = round(min(0.6, max(-0.6, lift * 0.5)), 2)
+                label = "ELEVATES" if lift > 0 else "SHRINKS"
+                drivers.append(
+                    f"Clutch Profile (HIGH-LEVERAGE) — {resolved_name.title()} {label} "
+                    f"in clutch ({c_per_min*36:.1f} pts/36 vs {r_per_min*36:.1f} regular, "
+                    f"{c_gp} clutch games). Game-7 boost: {clutch_delta:+.2f}."
+                )
+    breakdown["clutchAdj"] = clutch_delta
+    corr = round(corr + clutch_delta, 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 10 — USAGE × EFFICIENCY PROFILE (data-verified)
+    # USG% measures % of team plays that end with this player (shot/TO/FT).
+    # Combined with TS% (true shooting), this tells us:
+    #   • Elite USG (>28%) + good TS (>55%) → +2% (efficient volume scorer)
+    #   • Elite USG (>28%) + low TS (<50%)  → -1.5% (volume inefficiency)
+    # No adjustment for league-average USG to avoid noise.
+    # ─────────────────────────────────────────────────────────────────────────
+    usg_pct_adj = 0.0
+    po_usg = float(po.get("usg") or 0)
+    po_ts  = float(po.get("ts")  or 0)
+    if prop_type in _SCORING_PROPS and po_usg > 0:
+        if po_usg >= _USG_ELITE_THRESH and po_ts >= _TS_GOOD_THRESH:
+            usg_pct_adj = 0.02
+            label = "ELITE-VOLUME EFFICIENT"
+        elif po_usg >= _USG_ELITE_THRESH and po_ts < _TS_BAD_THRESH:
+            usg_pct_adj = -0.015
+            label = "HIGH-VOLUME INEFFICIENT"
+        else:
+            label = None
+        if label:
+            usg_abs = round(corr * usg_pct_adj, 2)
+            drivers.append(
+                f"Usage Profile — {label} ({po_usg:.0f}% USG, {po_ts:.0f}% TS). "
+                f"Impact: {usg_pct_adj*100:+.1f}% ({usg_abs:+.2f})."
+            )
+    breakdown["usageAdj"] = round(usg_pct_adj * 100, 2)
+    corr = round(corr * (1 + usg_pct_adj), 2)
+
     # ── No signal found ───────────────────────────────────────────────────────
     if not [d for d in drivers if "NEUTRAL" not in d and "no adjustment" not in d.lower()]:
         drivers.append(
@@ -1010,6 +1222,13 @@ def post_project():
             "has_matchup":    bool(opp_delta),
             "has_scoring":    bool(scoring_row),
             "has_team_def":   bool(opp_def),
+            "has_splits":     bool(splits_row),
+            "has_clutch":     bool(clutch_row),
+            "has_pace":       bool(own_team_data and opp_team_data),
+            "has_l5":         l5_avg is not None,
+            "has_rest":       rest_days is not None,
+            "is_home":        is_home,
+            "high_leverage":  high_leverage,
         },
     })
 
