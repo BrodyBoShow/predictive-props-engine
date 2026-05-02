@@ -17,8 +17,10 @@ import time
 import logging
 import threading
 import json
+import urllib.request
+import urllib.error
 
-SERVER_VERSION = "v5.3-multivar"  # 12-factor + 4-day schedule lookahead
+SERVER_VERSION = "v5.4-multivar"  # 12-factor + ESPN-driven dynamic schedule
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1347,6 +1349,105 @@ def _fmt_series(home_wins: int, away_wins: int, home_abbr: str, away_abbr: str) 
     return f"{leader} leads {max(home_wins, away_wins)}-{min(home_wins, away_wins)}"
 
 
+def _fetch_espn_games(date_yyyymmdd, et_label_for_today=None):
+    """
+    Fetch games from ESPN's public scoreboard API. Unlike NBA stats API,
+    ESPN includes CONDITIONAL Game 7s and the future playoff schedule
+    before games are officially decided.
+
+    date_yyyymmdd: 'YYYYMMDD' format (e.g., '20260503')
+    Returns list of normalized game dicts. Returns [] safely on any error.
+    """
+    url = (f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
+           f"scoreboard?dates={date_yyyymmdd}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        logging.warning("ESPN fetch failed for %s: %s", date_yyyymmdd, e)
+        return []
+
+    games = []
+    for event in (data.get("events") or []):
+        try:
+            comp_list = event.get("competitions") or []
+            if not comp_list:
+                continue
+            comp = comp_list[0]
+            competitors = comp.get("competitors") or []
+            home = next((c for c in competitors if c.get("homeAway") == "home"), {}) or {}
+            away = next((c for c in competitors if c.get("homeAway") == "away"), {}) or {}
+
+            home_team = home.get("team") or {}
+            away_team = away.get("team") or {}
+            home_abbr = home_team.get("abbreviation") or ""
+            away_abbr = away_team.get("abbreviation") or ""
+            home_full = home_team.get("displayName") or home_abbr
+            away_full = away_team.get("displayName") or away_abbr
+
+            # Series state — ESPN provides this even for conditional Game 7s
+            series = comp.get("series") or {}
+            series_summary = series.get("summary") or ""
+            game_num = series.get("currentGameNumber")
+
+            # Game name often includes "Game X" — extract for the title
+            event_name = event.get("name") or ""
+            event_short = event.get("shortName") or ""
+            title = f"Game {game_num}" if game_num else "Playoff Game"
+
+            # Game start time — ESPN returns ISO 8601 UTC
+            iso = event.get("date") or ""
+            time_str = iso  # client converts UTC→local
+            if iso:
+                # Convert "2026-05-03T17:00Z" → "May 3, 1:00 PM ET" for client display
+                try:
+                    dt_utc = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                    dt_et  = dt_utc.astimezone(timezone(timedelta(hours=-4)))
+                    time_str = dt_et.strftime("%a %b %-d, %-I:%M %p ET")
+                except Exception:
+                    # Windows strftime doesn't support %-d; fall back
+                    try:
+                        dt_utc = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                        dt_et  = dt_utc.astimezone(timezone(timedelta(hours=-4)))
+                        time_str = dt_et.strftime("%a %b %d, %I:%M %p ET").replace(" 0", " ")
+                    except Exception:
+                        time_str = iso
+
+            # Get current scores for in-progress/completed games
+            try:
+                home_score = int(home.get("score") or 0)
+                away_score = int(away.get("score") or 0)
+            except (TypeError, ValueError):
+                home_score = away_score = None
+
+            status_obj = (event.get("status") or {}).get("type") or {}
+            status_text = status_obj.get("shortDetail") or status_obj.get("description") or ""
+
+            entry = {
+                "id":        f"espn-{event.get('id','')}",
+                "home":      home_abbr,
+                "away":      away_abbr,
+                "homeTeam":  home_full,
+                "awayTeam":  away_full,
+                "time":      time_str,
+                "title":     title,
+                "series":    series_summary,
+                "restDays":  {},
+                "homeScore": home_score,
+                "awayScore": away_score,
+                "status":    status_text,
+            }
+            if home_abbr: entry[home_abbr] = _roster_for_team(home_abbr)
+            if away_abbr: entry[away_abbr] = _roster_for_team(away_abbr)
+            games.append(entry)
+        except Exception as e:
+            logging.warning("Skipping malformed ESPN event: %s", e)
+            continue
+
+    return games
+
+
 def _fetch_date_games(date_str):
     """
     Fetch scheduled NBA games for a specific date using stats scoreboard.
@@ -1489,7 +1590,10 @@ def get_schedule():
     except Exception as e:
         logging.error("Live scoreboard error: %s", e)
 
-    # ── If live scoreboard returned nothing, try stats scoreboard for today ──
+    # ── If live scoreboard returned nothing, try ESPN, then NBA stats API ──
+    if not today_games:
+        today_iso = now_et.strftime("%Y%m%d")
+        today_games = _fetch_espn_games(today_iso)
     if not today_games:
         try:
             today_games = _fetch_date_games(today_str)
@@ -1497,24 +1601,30 @@ def get_schedule():
             logging.warning("Today stats scoreboard fallback failed: %s", e)
             today_games = []
 
-    # ── Upcoming: scan next 4 days to find first day with scheduled games ────
-    # NBA only posts the next day's schedule once series outcomes are known,
-    # so tomorrow may be empty even though games exist 2-3 days out.
+    # ── Upcoming: scan next 4 days; prefer ESPN (has conditional Game 7s) ──
+    # ESPN posts the playoff schedule including conditional Game 7s well before
+    # NBA stats API officially confirms them. Falls back to NBA stats API.
     upcoming_games = []
     upcoming_date  = tomorrow_str
     upcoming_label = tomorrow_label
-    for offset in range(1, 5):  # check tomorrow, +2, +3, +4
+    for offset in range(1, 5):
         d = now_et + timedelta(days=offset)
-        ds = d.strftime("%m/%d/%Y")
-        try:
-            games = _fetch_date_games(ds)
-        except Exception as e:
-            logging.warning("Date %s lookup failed: %s", ds, e)
-            games = []
+        ds_us  = d.strftime("%m/%d/%Y")
+        ds_iso = d.strftime("%Y%m%d")
+        # 1. Try ESPN first (best for conditional/predicted games)
+        games = _fetch_espn_games(ds_iso)
+        # 2. Fall back to NBA stats API
+        if not games:
+            try:
+                games = _fetch_date_games(ds_us)
+            except Exception as e:
+                logging.warning("NBA stats fallback failed for %s: %s", ds_us, e)
+                games = []
         if games:
             upcoming_games = games
-            upcoming_date  = ds
+            upcoming_date  = ds_us
             upcoming_label = d.strftime(f"%b {d.day}")
+            logging.info("Upcoming games found for %s: %d", ds_us, len(games))
             break
 
     return jsonify({
