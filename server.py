@@ -189,7 +189,9 @@ def _build_teams():
         try:
             df = _try_team_fetch("Playoffs", measure)
             _sleep()
-            if not df.empty and "TEAM_ABBREVIATION" in df.columns:
+            # Accept DF if it has TEAM_ID or TEAM_ABBREVIATION (current nba_api omits TEAM_ABBREVIATION)
+            has_id = not df.empty and ("TEAM_ID" in df.columns or "TEAM_ABBREVIATION" in df.columns)
+            if has_id:
                 po_df = df
                 logging.info("PO team stats loaded via %s measure (%d teams)", measure, len(df))
                 break
@@ -221,7 +223,7 @@ def _build_teams():
             try:
                 df = _try_team_fetch("Regular Season", measure)
                 _sleep()
-                if not df.empty and ("TEAM_ABBREVIATION" in df.columns or "TEAM_ID" in df.columns):
+                if not df.empty and ("TEAM_ID" in df.columns or "TEAM_ABBREVIATION" in df.columns):
                     for _, row in df.iterrows():
                         abbr = (row.get("TEAM_ABBREVIATION")
                                 or _TEAM_ID_TO_ABBR.get(int(row.get("TEAM_ID", 0)))
@@ -557,8 +559,8 @@ def _build_matchup_delta():
                     ).get_data_frames()[0]
                     logging.info("matchup_delta direct [%s/%s] cols:%s rows:%d",
                                  season_type, measure, df.columns.tolist()[:8], len(df))
-                    has_id = "TEAM_ID" in df.columns or "TEAM_ABBREVIATION" in df.columns
-                    if df.empty or not has_id:
+                    has_id = not df.empty and ("TEAM_ID" in df.columns or "TEAM_ABBREVIATION" in df.columns)
+                    if not has_id:
                         continue
                     for _, row in df.iterrows():
                         abbr = (row.get("TEAM_ABBREVIATION")
