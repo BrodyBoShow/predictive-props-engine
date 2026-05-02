@@ -1389,12 +1389,17 @@ def _fetch_espn_games(date_yyyymmdd, et_label_for_today=None):
             # Series state — ESPN provides this even for conditional Game 7s
             series = comp.get("series") or {}
             series_summary = series.get("summary") or ""
-            game_num = series.get("currentGameNumber")
 
-            # Game name often includes "Game X" — extract for the title
-            event_name = event.get("name") or ""
-            event_short = event.get("shortName") or ""
-            title = f"Game {game_num}" if game_num else "Playoff Game"
+            # Extract game number from notes (e.g., "East 1st Round - Game 7")
+            notes = comp.get("notes") or []
+            note_headline = notes[0].get("headline", "") if notes else ""
+            title = "Playoff Game"
+            import re as _re
+            m = _re.search(r"Game\s+(\d+)", note_headline)
+            if m:
+                title = f"Game {m.group(1)}"
+            elif series.get("currentGameNumber"):
+                title = f"Game {series['currentGameNumber']}"
 
             # Game start time — ESPN returns ISO 8601 UTC
             iso = event.get("date") or ""
