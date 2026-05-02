@@ -1112,6 +1112,30 @@ def get_version():
     return {"version": SERVER_VERSION, "ready": _warmup_done.is_set()}
 
 
+@app.route("/api/debug-teams")
+def debug_teams():
+    """Diagnostic: try each measure type and return actual errors + column names."""
+    results = {}
+    for season_type in ("Playoffs", "Regular Season"):
+        for measure in ("Advanced", "Opponent", "Base"):
+            key = f"{season_type}/{measure}"
+            try:
+                df = leaguedashteamstats.LeagueDashTeamStats(
+                    season=SEASON, season_type_all_star=season_type,
+                    per_mode_detailed="PerGame",
+                    measure_type_detailed_defense=measure,
+                ).get_data_frames()[0]
+                results[key] = {
+                    "rows": len(df),
+                    "cols": df.columns.tolist()[:15],
+                    "has_team_abbr": "TEAM_ABBREVIATION" in df.columns,
+                    "sample": df.iloc[0].to_dict() if not df.empty else {},
+                }
+            except Exception as e:
+                results[key] = {"error": str(e), "type": type(e).__name__}
+    return jsonify(results)
+
+
 @app.route("/api/ready")
 def get_ready():
     """Lightweight ping — returns {ready: true} once players cache is populated.
