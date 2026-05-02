@@ -364,45 +364,64 @@ def _build_hustle():
 
 def _build_tracking():
     """
-    Player tracking stats (Playoffs) — passing + rebounding merged per player.
+    Player tracking stats — passing + rebounding merged per player.
+    Tries Playoffs first; falls back to Regular Season if PO data is empty
+    (tracking data is sparse early in the playoffs).
     Passing  → POTENTIAL_AST, AST, PASSES_MADE (for AST conversion rate)
     Rebounding → OREB_CHANCE, DREB_CHANCE, REB_CHANCE_PCT (optional enrichment)
     """
-    logging.info("Fetching PO passing tracking stats...")
-    pass_df = leaguedashptstats.LeagueDashPtStats(
-        season=SEASON,
-        season_type_all_star="Playoffs",
-        per_mode_simple="PerGame",
-        pt_measure_type="Passing",
-    ).get_data_frames()[0]
-    logging.info("Passing tracking cols: %s", pass_df.columns.tolist()[:10])
-    _sleep()
-
-    # ── Rebounding tracking (optional enrichment — some seasons return different schema) ──
-    reb_idx = {}
-    try:
-        logging.info("Fetching PO rebounding tracking stats...")
-        reb_df = leaguedashptstats.LeagueDashPtStats(
+    def _fetch_passing(season_type):
+        df = leaguedashptstats.LeagueDashPtStats(
             season=SEASON,
-            season_type_all_star="Playoffs",
+            season_type_all_star=season_type,
+            per_mode_simple="PerGame",
+            pt_measure_type="Passing",
+        ).get_data_frames()[0]
+        logging.info("Passing tracking [%s] cols: %s  rows: %d",
+                     season_type, df.columns.tolist()[:8], len(df))
+        return df
+
+    def _fetch_rebounding(season_type):
+        return leaguedashptstats.LeagueDashPtStats(
+            season=SEASON,
+            season_type_all_star=season_type,
             per_mode_simple="PerGame",
             pt_measure_type="Rebounding",
         ).get_data_frames()[0]
-        logging.info("Rebounding tracking cols: %s", reb_df.columns.tolist()[:10])
 
-        # The player ID column name varies by nba_api version — detect it
-        pid_col = next(
-            (c for c in ["PLAYER_ID", "PlayerID", "PERSONID"] if c in reb_df.columns),
-            None,
-        )
-        if pid_col:
-            reb_idx = reb_df.set_index(pid_col).to_dict("index")
-            logging.info("Rebounding tracking indexed on %s (%d rows)", pid_col, len(reb_idx))
-        else:
-            logging.warning("Rebounding tracking DF has no player ID column — skipping. Cols: %s",
-                            reb_df.columns.tolist())
-    except Exception as e:
-        logging.warning("Could not build rebounding tracking: %s", e)
+    # Try PO first, fall back to RS if empty
+    pass_df = None
+    for stype in ("Playoffs", "Regular Season"):
+        try:
+            df = _fetch_passing(stype)
+            _sleep()
+            if not df.empty and "PLAYER_ID" in df.columns:
+                pass_df = df
+                logging.info("Using %s passing tracking (%d players)", stype, len(df))
+                break
+        except Exception as e:
+            logging.warning("Passing tracking [%s] failed: %s", stype, e)
+
+    if pass_df is None or pass_df.empty:
+        logging.warning("No passing tracking data available — tracking cache will be empty")
+        return {}
+
+    # ── Rebounding (optional enrichment) ─────────────────────────────────────
+    reb_idx = {}
+    for stype in ("Playoffs", "Regular Season"):
+        try:
+            reb_df = _fetch_rebounding(stype)
+            _sleep()
+            pid_col = next(
+                (c for c in ["PLAYER_ID", "PlayerID", "PERSONID"] if c in reb_df.columns),
+                None,
+            )
+            if pid_col and not reb_df.empty:
+                reb_idx = reb_df.set_index(pid_col).to_dict("index")
+                logging.info("Rebounding tracking [%s] %d players", stype, len(reb_idx))
+                break
+        except Exception as e:
+            logging.warning("Rebounding tracking [%s] failed: %s", stype, e)
 
     # ── Detect player ID / name columns in passing DF ──────────────────────────
     pid_col  = next((c for c in ["PLAYER_ID", "PlayerID", "PERSONID"] if c in pass_df.columns), None)
@@ -442,80 +461,88 @@ def _build_tracking():
 
 def _build_matchup_delta():
     """
-    Per-team last-5-game rolling dEFF vs full-PO-season dEFF.
-    Positive delta → opp got softer defensively → project UP.  Cap ±6%.
-    Falls back to RS Advanced if PO season data is unavailable.
+    Matchup quality score per team, built from the already-cached teams data
+    (avoids unreliable last_n_games API calls that return inconsistent column schemas).
+
+    Uses PO dEFF vs league-average PO dEFF:
+      dEFF_delta = team_dEFF - league_avg_dEFF
+      Positive = team allows more points than avg → project UP for offensive props
+      Negative = elite defense → project DOWN
+
+    This replaces the L5 rolling approach because LeagueDashTeamStats with
+    last_n_games returns inconsistent column schemas for small playoff sample sizes.
     """
-    def _fetch_team_adv(season_type, last_n=0):
-        kwargs = dict(
-            season=SEASON,
-            season_type_all_star=season_type,
-            per_mode_detailed="PerGame",
-            measure_type_detailed_defense="Advanced",
-        )
-        if last_n:
-            kwargs["last_n_games"] = last_n
-        df = leaguedashteamstats.LeagueDashTeamStats(**kwargs).get_data_frames()[0]
-        logging.info("%s last_n=%s cols: %s", season_type, last_n, df.columns.tolist()[:8])
-        return df
+    # Wait up to 60s for the teams cache to be populated (it builds earlier in warmup)
+    teams_cache = None
+    for _ in range(6):
+        teams_cache = _cache_get("teams")
+        if teams_cache:
+            break
+        logging.info("matchup_delta: waiting for teams cache...")
+        time.sleep(10)
 
-    # ── L5 games (best effort) ────────────────────────────────────────────────
-    l5_df = None
-    for stype in ("Playoffs", "Regular Season"):
+    if not teams_cache:
+        # Last resort: fetch RS team stats directly
+        logging.info("matchup_delta: teams cache unavailable, fetching RS directly...")
         try:
-            l5_df = _fetch_team_adv(stype, last_n=5)
-            _sleep()
-            if not l5_df.empty and "TEAM_ABBREVIATION" in l5_df.columns:
-                logging.info("L5 team stats from %s (%d teams)", stype, len(l5_df))
-                break
+            df = leaguedashteamstats.LeagueDashTeamStats(
+                season=SEASON, season_type_all_star="Regular Season",
+                per_mode_detailed="PerGame",
+                measure_type_detailed_defense="Advanced",
+            ).get_data_frames()[0]
+            logging.info("Direct RS team cols: %s", df.columns.tolist()[:8])
+            abbr_col = next((c for c in ["TEAM_ABBREVIATION", "TEAM_ABB"] if c in df.columns), None)
+            if abbr_col is None or df.empty:
+                logging.warning("matchup_delta: direct RS fetch also failed")
+                return {}
+            teams_raw = {}
+            for _, row in df.iterrows():
+                abbr = row[abbr_col]
+                teams_raw[abbr] = {
+                    "dEFF": _f(row.get("DEF_RATING", 113.5)),
+                    "oEFF": _f(row.get("OFF_RATING", 113.5)),
+                    "pace": _f(row.get("PACE", 100.0)),
+                }
         except Exception as e:
-            logging.warning("L5 team stats failed for %s: %s", stype, e)
-
-    if l5_df is None or l5_df.empty:
-        logging.warning("Could not fetch L5 team stats — matchup delta will be empty")
-        return {}
-
-    # ── Season baseline ────────────────────────────────────────────────────────
-    season_idx = {}
-    for stype in ("Playoffs", "Regular Season"):
-        try:
-            season_df = _fetch_team_adv(stype)
-            _sleep()
-            if "TEAM_ABBREVIATION" in season_df.columns and not season_df.empty:
-                season_idx = season_df.set_index("TEAM_ABBREVIATION").to_dict("index")
-                logging.info("Season baseline from %s (%d teams)", stype, len(season_idx))
-                break
-        except Exception as e:
-            logging.warning("Season team stats failed for %s: %s", stype, e)
-
-    # ── Build delta dict ──────────────────────────────────────────────────────
-    delta = {}
-    abbr_col = next((c for c in ["TEAM_ABBREVIATION", "TEAM_ABB"] if c in l5_df.columns), None)
-    if abbr_col is None:
-        logging.warning("L5 team DF has no abbreviation column. Cols: %s", l5_df.columns.tolist())
-        return {}
-
-    for _, row in l5_df.iterrows():
-        abbr        = row[abbr_col]
-        season      = season_idx.get(abbr, {})
-        l5_dEFF     = _f(row.get("DEF_RATING",  113.5))
-        season_dEFF = _f(season.get("DEF_RATING", l5_dEFF))   # fallback: no delta
-        l5_oEFF     = _f(row.get("OFF_RATING",  113.5))
-        season_oEFF = _f(season.get("OFF_RATING", l5_oEFF))
-
-        delta[abbr] = {
-            "l5_dEFF":     l5_dEFF,
-            "season_dEFF": season_dEFF,
-            "dEFF_delta":  round(l5_dEFF - season_dEFF, 2),
-            "l5_oEFF":     l5_oEFF,
-            "season_oEFF": season_oEFF,
-            "oEFF_delta":  round(l5_oEFF - season_oEFF, 2),
-            "l5_pace":     _f(row.get("PACE",    100.0)),
-            "season_pace": _f(season.get("PACE", 100.0)),
-            "gp":          _i(row.get("GP", 0)),
+            logging.warning("matchup_delta: RS direct fetch failed: %s", e)
+            return {}
+    else:
+        teams_raw = {
+            abbr: {"dEFF": v.get("dEFF") or 113.5, "oEFF": v.get("oEFF") or 113.5,
+                   "pace": v.get("rsPace") or 100.0}
+            for abbr, v in teams_cache.get("teams", {}).items()
         }
 
-    logging.info("Built matchup delta for %d teams", len(delta))
+    if not teams_raw:
+        logging.warning("matchup_delta: no team data available")
+        return {}
+
+    # ── Compute league averages ───────────────────────────────────────────────
+    deffs = [v["dEFF"] for v in teams_raw.values() if v["dEFF"]]
+    oeffs = [v["oEFF"] for v in teams_raw.values() if v["oEFF"]]
+    league_avg_deff = round(sum(deffs) / len(deffs), 1) if deffs else 113.5
+    league_avg_oeff = round(sum(oeffs) / len(oeffs), 1) if oeffs else 113.5
+
+    # ── Build delta dict (quality vs league avg) ──────────────────────────────
+    delta = {}
+    for abbr, stats in teams_raw.items():
+        deff = stats["dEFF"]
+        oeff = stats["oEFF"]
+        delta[abbr] = {
+            "l5_dEFF":     deff,
+            "season_dEFF": league_avg_deff,
+            # positive = this team allows MORE than avg → project opponent stats UP
+            "dEFF_delta":  round(deff - league_avg_deff, 2),
+            "l5_oEFF":     oeff,
+            "season_oEFF": league_avg_oeff,
+            "oEFF_delta":  round(oeff - league_avg_oeff, 2),
+            "l5_pace":     stats["pace"],
+            "season_pace": stats["pace"],
+            "gp":          0,
+        }
+
+    logging.info("Built matchup delta for %d teams (vs league avg dEFF=%.1f)",
+                 len(delta), league_avg_deff)
     return delta
 
 
