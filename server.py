@@ -20,7 +20,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v5.4-multivar"  # 12-factor + ESPN-driven dynamic schedule
+SERVER_VERSION = "v5.5-multivar"  # baseline synced with client (L5-weighted)
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -812,11 +812,16 @@ def _resolve_player(name: str, players_cache: dict):
     return None, None
 
 
-def _base_stat(po, rs, prop_type, scoring_row=None):
+def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None):
     """
-    Return the weighted blended base stat for the given prop type.
-    Blend: PO 65% / RS 35% (PO is more predictive in playoff context).
-    Falls back to whichever is available.
+    Return the weighted blended base stat. SYNCED with client baseline so
+    client and server start from the same number:
+       L5 available + sufficient PO/RS sample → PO 40% + RS 25% + L5 35%
+       PO + RS only                            → PO 65% + RS 35%
+       PO only                                 → PO
+       RS only                                 → RS
+
+    L5 is the most predictive short-term signal (recent form).
     """
     def _s(d, k): return float(d.get(k) or 0)
 
@@ -830,7 +835,6 @@ def _base_stat(po, rs, prop_type, scoring_row=None):
         po_v = _s(po, "ppg") + _s(po, "rpg")
         rs_v = _s(rs, "ppg") + _s(rs, "rpg")
     elif prop_type == "three_pointers":
-        # FG3M ≈ PPG × (pctPts3pt / 100) / 3 — scoring cache required
         pct = float((scoring_row or {}).get("pctPts3pt") or 0)
         po_v = _s(po, "ppg") * (pct / 100) / 3 if pct > 0 else 0
         rs_v = _s(rs, "ppg") * (pct / 100) / 3 if pct > 0 else 0
@@ -842,6 +846,17 @@ def _base_stat(po, rs, prop_type, scoring_row=None):
 
     po_gp = int(po.get("gp") or 0)
     rs_gp = int(rs.get("gp") or 0)
+
+    # Try L5-aware blend first (matches client formula exactly)
+    if l5_avg is not None and po_gp >= 3 and rs_gp >= 5:
+        try:
+            l5 = float(l5_avg)
+            if l5 > 0:
+                return round(po_v * 0.40 + rs_v * 0.25 + l5 * 0.35, 2)
+        except (TypeError, ValueError):
+            pass
+
+    # Fallback hierarchy
     if po_gp >= 3 and rs_gp >= 5:
         return round(po_v * 0.65 + rs_v * 0.35, 2)
     elif po_gp >= 1:
@@ -920,8 +935,8 @@ def post_project():
     own_team_data = teams_cache.get(own_team, {}) if own_team else {}
     opp_team_data = teams_cache.get(opp_abbr, {}) if opp_abbr else {}
 
-    # ── Base projection ───────────────────────────────────────────────────────
-    base = _base_stat(po, rs, prop_type, scoring_row)
+    # ── Base projection (L5-aware to match client baseline exactly) ──────────
+    base = _base_stat(po, rs, prop_type, scoring_row, l5_avg=l5_avg)
     corr = base
     drivers   = []
     breakdown = {}
@@ -1073,31 +1088,42 @@ def post_project():
     corr = round(corr * (1 + pace_pct), 2)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 6 — RECENT FORM / L5 BLEND (client-passed)
-    # Client computes L5 PO average from real game logs. Server blends a portion
-    # of the divergence into projection. Recent games are 2-3x more predictive
-    # than full-season averages for short-term outcomes.
-    # Cap ±8%.
+    # ADJUSTMENT 6 — RECENT FORM (informational driver, not double-counted)
+    # L5 is now baked into the BASELINE itself (35% weight in _base_stat),
+    # so we don't apply a SECOND adjustment on top. Instead, expose the L5
+    # divergence vs RS+PO blend as an informational driver if meaningful.
     # ─────────────────────────────────────────────────────────────────────────
     form_delta = 0.0
-    if l5_avg is not None and base > 0:
+    if l5_avg is not None:
         try:
             l5 = float(l5_avg)
-            if l5 > 0:
-                divergence = (l5 - base) / base
-                if abs(divergence) >= 0.05:  # only when ≥5% divergence
-                    form_pct = min(_FORM_CAP, max(-_FORM_CAP, divergence * _FORM_BLEND_WEIGHT))
-                    form_delta = round(corr * form_pct, 2)
-                    trend = "HOT" if divergence > 0 else "COLD"
-                    drivers.append(
-                        f"Recent Form — {resolved_name.title()} {trend} over L5 "
-                        f"({l5:.1f} vs {base:.1f} blended base, {divergence*100:+.1f}%). "
-                        f"Recency-weighted blend: {form_delta:+.2f}."
-                    )
+            # Compare L5 vs PO+RS-only blend (without L5) for an info-only "form" signal
+            def _s2(d, k): return float(d.get(k) or 0)
+            key_map_2 = {"points":"ppg","assists":"apg","rebounds":"rpg",
+                         "steals":"spg","blocks":"bpg",
+                         "pra":("ppg","rpg","apg"),"pa":("ppg","apg"),"pr":("ppg","rpg")}
+            k2 = key_map_2.get(prop_type)
+            if k2 and l5 > 0:
+                if isinstance(k2, tuple):
+                    po_v2 = sum(_s2(po, x) for x in k2)
+                    rs_v2 = sum(_s2(rs, x) for x in k2)
+                else:
+                    po_v2 = _s2(po, k2)
+                    rs_v2 = _s2(rs, k2)
+                season_blend = round(po_v2 * 0.65 + rs_v2 * 0.35, 2)
+                if season_blend > 0:
+                    divergence = (l5 - season_blend) / season_blend
+                    if abs(divergence) >= 0.10:  # only call out meaningful divergence
+                        trend = "HOT" if divergence > 0 else "COLD"
+                        drivers.append(
+                            f"Recent Form — {resolved_name.title()} {trend} over L5 "
+                            f"({l5:.1f} vs {season_blend:.1f} season blend, "
+                            f"{divergence*100:+.1f}%). Already blended into base "
+                            f"projection (L5 = 35% weight)."
+                        )
         except (TypeError, ValueError):
             pass
-    breakdown["recentFormAdj"] = form_delta
-    corr = round(corr + form_delta, 2)
+    breakdown["recentFormAdj"] = form_delta  # always 0 now (baked into base)
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 7 — REST DAYS (client-passed)
