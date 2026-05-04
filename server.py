@@ -32,11 +32,12 @@ _INJURY_OVERRIDES = {
     "franz wagner":     {"status": "Out",          "detail": "Calf strain — confirmed OUT (ESPN May 3 2026)", "team": "ORL"},
     "kevin durant":     {"status": "Out",          "detail": "Left ankle bone bruise — out (NBA official)", "team": "HOU"},
     "fred vanvleet":    {"status": "Out",          "detail": "Right knee ACL repair — out for season", "team": "CLE"},
-    "anthony edwards":  {"status": "Out",          "detail": "Left knee hyperextension + bone bruise", "team": "MIN"},
     "donte divincenzo": {"status": "Out",          "detail": "Right Achilles repair — out for season", "team": "NYK"},
     "luka doncic":      {"status": "Out",          "detail": "Left hamstring strain — no timetable", "team": "LAL"},
     "steven adams":     {"status": "Out",          "detail": "Left ankle surgery — out for season", "team": "HOU"},
     "austin reaves":    {"status": "Questionable", "detail": "Left oblique strain — day-to-day", "team": "LAL"},
+    "ayo dosunmu":      {"status": "Out",          "detail": "Injury — confirmed OUT (May 2026)", "team": "MIN"},
+    # anthony edwards: ACTIVE — returned from knee injury, removed from overrides May 4 2026
 }
 
 logging.basicConfig(level=logging.INFO)
