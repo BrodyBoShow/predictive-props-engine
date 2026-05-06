@@ -1,4 +1,5 @@
 import math
+import random
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from nba_api.stats.endpoints import (
@@ -21,7 +22,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.2-ra"  # +R+A prop type
+SERVER_VERSION = "v6.3-mc"  # +Monte Carlo (10K bootstrap sims)
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -955,6 +956,102 @@ def _confidence_band(stat_values, projection):
     }
 
 
+def _monte_carlo(stat_values, projection, book_line, n_sims=10000, seed=None):
+    """
+    Bootstrap Monte Carlo simulation around the projected value.
+
+    Method: non-parametric bootstrap from the L5 (or longer) game log,
+    *recentered* on the model's projection. This preserves the empirical
+    shape of the player's distribution (skew, kurtosis, blowout outliers)
+    rather than assuming normality — critical for stats like 3PM and TOV
+    which are highly right-skewed.
+
+    Pipeline:
+      1. shift = projection - mean(stat_values)
+         → recenters the distribution so its mean equals the model projection
+      2. For n_sims iterations: pick random sample from stat_values, add shift
+      3. Sort the simulated array; compute percentiles
+      4. prob_over  = #(sims > book_line) / n_sims
+         prob_under = #(sims < book_line) / n_sims
+         prob_push  = 1 - prob_over - prob_under  (only when line is integer)
+      5. implied_fair_line = median (50th percentile) — the line at which
+         a coin-flip bet is mathematically fair. If finalProj=22 but P50=21,
+         the model's "true" expectation is 21 (skewed distribution).
+
+    Returns dict or None when sample is too small (< 3 games).
+
+    Args:
+        stat_values: list of historical per-game stat values (L5 game log)
+        projection:  the model's correlated projection (mean of recentered dist)
+        book_line:   the sportsbook line (used for prob_over/under)
+        n_sims:      number of bootstrap samples (default 10K)
+        seed:        optional RNG seed for reproducibility (None = nondeterministic)
+    """
+    if not stat_values or len(stat_values) < 3:
+        return None
+    try:
+        arr = [float(v) for v in stat_values if v is not None]
+    except (TypeError, ValueError):
+        return None
+    if len(arr) < 3:
+        return None
+
+    sample_mean = sum(arr) / len(arr)
+    shift = projection - sample_mean
+
+    rng = random.Random(seed) if seed is not None else random
+    sims = [rng.choice(arr) + shift for _ in range(n_sims)]
+    # Floor at 0 — counting stats can't be negative
+    sims = [max(0.0, s) for s in sims]
+    sims.sort()
+
+    def pctl(p):
+        idx = max(0, min(n_sims - 1, int(n_sims * p)))
+        return round(sims[idx], 2)
+
+    p10, p25, p50, p75, p90 = pctl(.10), pctl(.25), pctl(.50), pctl(.75), pctl(.90)
+
+    prob_over = prob_under = prob_push = None
+    if book_line is not None and book_line > 0:
+        # For integer lines (e.g. 5), allow a tiny epsilon for "push"
+        # Most NBA lines are .5 lines so push is impossible
+        is_integer = abs(book_line - round(book_line)) < 1e-6
+        if is_integer:
+            eps = 0.5
+            prob_over  = round(sum(1 for s in sims if s > book_line + eps) / n_sims, 4)
+            prob_under = round(sum(1 for s in sims if s < book_line - eps) / n_sims, 4)
+            prob_push  = round(max(0.0, 1.0 - prob_over - prob_under), 4)
+        else:
+            prob_over  = round(sum(1 for s in sims if s > book_line) / n_sims, 4)
+            prob_under = round(sum(1 for s in sims if s < book_line) / n_sims, 4)
+            prob_push  = 0.0
+
+    # Decimal-odds equivalent: implied fair payout = 1 / prob_over (American: ±)
+    fair_odds_over = round(1.0 / prob_over, 3) if prob_over and prob_over > 0 else None
+    fair_odds_under = round(1.0 / prob_under, 3) if prob_under and prob_under > 0 else None
+
+    # Edge-from-50: how far is prob_over from a coin-flip? (Vegas vig is usually ~4.5%)
+    # Anything > 0.55 with low CV is a strong play.
+    edge_from_50 = round((prob_over - 0.5) * 100, 2) if prob_over is not None else None
+
+    return {
+        "n_sims":             n_sims,
+        "p10":                p10,
+        "p25":                p25,
+        "p50":                p50,
+        "p75":                p75,
+        "p90":                p90,
+        "implied_fair_line":  p50,
+        "prob_over":          prob_over,
+        "prob_under":         prob_under,
+        "prob_push":          prob_push,
+        "fair_odds_over":     fair_odds_over,
+        "fair_odds_under":    fair_odds_under,
+        "edge_from_50":       edge_from_50,
+        "method":             "bootstrap_recentered",
+    }
+
+
 def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
                l5_min=None, own_team_data=None, opp_team_data=None):
     """
@@ -1762,11 +1859,20 @@ def post_project():
 
     # ── Confidence band — variance-aware uncertainty range from L5 game log ───
     confidence_band = None
+    monte_carlo     = None
     if l5_stat_values and len(l5_stat_values) >= 3:
         try:
             vals = [float(v) for v in l5_stat_values if v is not None]
             if len(vals) >= 3:
                 confidence_band = _confidence_band(vals, corr)
+                # Monte Carlo bootstrap — empirical-distribution probabilities
+                # Seed by player+prop+date for reproducibility within a single
+                # game day (same inputs → same probabilities all night).
+                try:
+                    seed = hash((resolved_name, prop_type, datetime.now().strftime("%Y%m%d"))) & 0xFFFFFFFF
+                    monte_carlo = _monte_carlo(vals, corr, book_line, n_sims=10000, seed=seed)
+                except Exception as e:
+                    logging.warning("Monte Carlo failed for %s/%s: %s", resolved_name, prop_type, e)
         except (TypeError, ValueError) as e:
             logging.warning("Confidence band computation failed: %s", e)
 
@@ -1787,6 +1893,7 @@ def post_project():
         "book_line":             book_line,
         "book_gap":              book_gap,
         "confidence_band":       confidence_band,
+        "monte_carlo":           monte_carlo,
         "drivers":               drivers,
         "breakdown":             breakdown,
         "data_quality": {
