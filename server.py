@@ -21,7 +21,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.0-refactor"  # rate×min baseline, dynamic weights, sigmoid caps, EWMA defense composite
+SERVER_VERSION = "v6.1-confidence"  # +confidence band +blowout discount +injury cap bump
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -912,6 +912,48 @@ def _resolve_player(name: str, players_cache: dict):
     return None, None
 
 
+def _confidence_band(stat_values, projection):
+    """
+    Variance-aware confidence band from a list of L5 game-by-game stat values.
+
+    Formula:
+      mean   = avg(values)
+      std    = sqrt( sum((x - mean)^2) / n )
+      cv     = std / mean                 (coefficient of variation)
+      floor  = max(0, projection - 1σ)    (~68% probability lower bound)
+      ceiling= projection + 1σ            (~68% probability upper bound)
+      trust  = 100 * (1 - 2*cv)           (clamped 0..100)
+
+    Trust score interpretation:
+      ≥ 70 → tight band, projection is reliable
+      40-70 → moderate variance, exercise caution
+      < 40 → high volatility (Duncan Robinson, role players); projection is noisy
+
+    Returns dict or None when insufficient sample.
+    """
+    if not stat_values or len(stat_values) < 3:
+        return None
+    n = len(stat_values)
+    mean = sum(stat_values) / n
+    if mean <= 0:
+        return None
+    var = sum((x - mean) ** 2 for x in stat_values) / n
+    std = math.sqrt(var)
+    cv = std / mean
+    floor   = round(max(0.0, projection - std), 2)
+    ceiling = round(projection + std, 2)
+    trust   = max(0.0, min(100.0, 100.0 * (1.0 - cv * 2.0)))
+    return {
+        "mean":        round(mean, 2),
+        "std":         round(std, 2),
+        "cv":          round(cv, 3),
+        "floor":       floor,
+        "ceiling":     ceiling,
+        "trust_score": int(round(trust)),
+        "n":           n,
+    }
+
+
 def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
                l5_min=None, own_team_data=None, opp_team_data=None):
     """
@@ -1057,6 +1099,7 @@ def post_project():
     # Optional context from client (enriches server projection — never fabricated)
     l5_avg       = body.get("l5_avg")        # client-computed L5 PO avg for this prop
     l5_min       = body.get("l5_min")        # client-computed L5 PO minutes/game (from /api/recent)
+    l5_stat_values = body.get("l5_stat_values") or []  # array of L5 stat values for THIS prop (for variance band)
     rest_days    = body.get("rest_days")     # player's team rest days (int)
     team_abbr    = (body.get("team_abbr") or "").strip().upper()  # player's own team
     is_home      = body.get("is_home")       # bool: player playing at home?
@@ -1612,7 +1655,7 @@ def post_project():
                 boost    = freed * share
                 my_stat  = float(po.get(my_stat_key) or rs.get(my_stat_key) or 1)
                 raw_pct  = boost / max(my_stat, 1)
-                inj_cascade_pct = max(0.0, _soft_cap(raw_pct, 0.15))  # sigmoid, was hard cap +15%
+                inj_cascade_pct = max(0.0, _soft_cap(raw_pct, 0.20))  # sigmoid, bumped to +20% (was 0.15) — sportsbooks slow on DNPs
                 if inj_cascade_pct >= 0.01:
                     boost_abs = round(corr * inj_cascade_pct, 2)
                     out_names = ", ".join(p["name"].title() for p in teammates_out[:3])
@@ -1623,6 +1666,40 @@ def post_project():
                     )
     breakdown["injCascadeAdj"] = round(inj_cascade_pct * 100, 2)
     corr = round(corr * (1 + inj_cascade_pct), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 15 — BLOWOUT DISCOUNT (high-usage stars sit late in blowouts)
+    # When a star (USG ≥ 25%) is on a heavily favored team (net rating diff
+    # ≥ +6 pts), they sit more in the 4th. Apply minute discount.
+    # Targets the SGA-18, Cade-23, Reaves-8 type misses where the model
+    # over-projects because it can't see end-of-game garbage time.
+    # No effect on non-stars (low USG keeps you on the floor either way).
+    # ─────────────────────────────────────────────────────────────────────────
+    blowout_pct = 0.0
+    if (prop_type in _COUNTING_PROPS and own_team_data and opp_team_data):
+        star_usg = float(po.get("usg") or rs.get("usg") or 0)
+        if star_usg >= 25.0:
+            own_oEFF = float(own_team_data.get("rsOEFF") or 113.0)
+            own_dEFF = float(own_team_data.get("rsDEFF") or 113.0)
+            opp_oEFF = float(opp_team_data.get("rsOEFF") or 113.0)
+            opp_dEFF = float(opp_team_data.get("rsDEFF") or 113.0)
+            own_net  = own_oEFF - own_dEFF
+            opp_net  = opp_oEFF - opp_dEFF
+            net_diff = own_net - opp_net   # >0 → own team favored
+            if net_diff >= 6.0:
+                # Linear ramp: -1.5% at +6, -3.0% at +12+
+                raw_pct = -0.015 * min(2.0, net_diff / 6.0)
+                blowout_pct = _soft_cap(raw_pct, 0.04)   # sigmoid, max ±4%
+                if abs(blowout_pct) >= 0.005:
+                    blowout_abs = round(corr * blowout_pct, 2)
+                    drivers.append(
+                        f"Blowout Risk — {own_team} favored by net {net_diff:+.1f} "
+                        f"(own {own_net:+.1f} vs opp {opp_net:+.1f}). "
+                        f"Star ({star_usg:.0f}% USG) likely sits late. "
+                        f"Minutes discount: {blowout_pct*100:+.1f}% ({blowout_abs:+.2f})."
+                    )
+    breakdown["blowoutAdj"] = round(blowout_pct * 100, 2)
+    corr = round(corr * (1 + blowout_pct), 2)
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 14 — RESIDUAL CALIBRATION (model learns from historical errors)
@@ -1676,6 +1753,21 @@ def post_project():
     # ── EV Edge ───────────────────────────────────────────────────────────────
     ev_edge = round((corr / book_line) - 1, 4) if (book_line and book_line > 0) else None
 
+    # ── Confidence band — variance-aware uncertainty range from L5 game log ───
+    confidence_band = None
+    if l5_stat_values and len(l5_stat_values) >= 3:
+        try:
+            vals = [float(v) for v in l5_stat_values if v is not None]
+            if len(vals) >= 3:
+                confidence_band = _confidence_band(vals, corr)
+        except (TypeError, ValueError) as e:
+            logging.warning("Confidence band computation failed: %s", e)
+
+    # ── Book-line gap (model-vs-book disagreement, used in client grading) ────
+    book_gap = None
+    if book_line and book_line > 0:
+        book_gap = round(abs(corr - book_line) / book_line, 4)
+
     return jsonify({
         "success":               True,
         "player":                resolved_name,
@@ -1686,6 +1778,8 @@ def post_project():
         "correlated_projection": corr,
         "ev_edge":               ev_edge,
         "book_line":             book_line,
+        "book_gap":              book_gap,
+        "confidence_band":       confidence_band,
         "drivers":               drivers,
         "breakdown":             breakdown,
         "data_quality": {
@@ -1700,6 +1794,7 @@ def post_project():
             "has_pace":       bool(own_team_data and opp_team_data),
             "has_l5":         l5_avg is not None,
             "has_l5_min":     l5_min is not None,
+            "has_l5_games":   bool(l5_stat_values),
             "use_rate_base":  use_rate_base,
             "has_rest":       rest_days is not None,
             "is_home":        is_home,
@@ -2209,6 +2304,23 @@ def _game_log_avg(df):
     }
 
 
+def _game_log_array(df):
+    """Per-game stat array (newest first) — feeds confidence band variance calc."""
+    out = []
+    for _, row in df.iterrows():
+        out.append({
+            "pts":  _f(row.get("PTS")  or 0),
+            "reb":  _f(row.get("REB")  or 0),
+            "ast":  _f(row.get("AST")  or 0),
+            "stl":  _f(row.get("STL")  or 0),
+            "blk":  _f(row.get("BLK")  or 0),
+            "fg3m": _f(row.get("FG3M") or 0),
+            "min":  _f(_parse_min(row.get("MIN"))),
+            "date": str(row.get("GAME_DATE") or ""),
+        })
+    return out
+
+
 @app.route("/api/recent/<int:player_id>")
 def get_recent(player_id):
     try:
@@ -2216,9 +2328,14 @@ def get_recent(player_id):
             player_id=player_id, season=SEASON, season_type_all_star="Playoffs",
         ).get_data_frames()[0]
         if logs.empty:
-            return {"success": True, "recent": None, "gp": 0}
+            return {"success": True, "recent": None, "gp": 0, "gameLog": []}
         recent = logs.head(5)
-        return {"success": True, "recent": _game_log_avg(recent), "gp": len(recent)}
+        return {
+            "success": True,
+            "recent":  _game_log_avg(recent),
+            "gp":      len(recent),
+            "gameLog": _game_log_array(recent),  # per-game array for variance band
+        }
     except Exception as e:
         logging.error("Error fetching recent: %s", e)
         return {"success": False, "error": str(e)}, 500
