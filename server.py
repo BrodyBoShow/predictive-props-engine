@@ -22,7 +22,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.7-espn-fix"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.8-box-date-fix"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2848,7 +2848,7 @@ def _game_log_array(df):
             "min":     _f(_parse_min(row.get("MIN"))),
             "wl":      str(row.get("WL")       or ""),
             "matchup": str(row.get("MATCHUP")  or ""),
-            "date":    str(row.get("GAME_DATE") or ""),
+            "date":    pd.to_datetime(str(row.get("GAME_DATE") or ""), errors="coerce").strftime("%Y-%m-%d") if row.get("GAME_DATE") else "",
         })
     return out
 
@@ -2861,9 +2861,16 @@ def get_box_results(player_id, date_str=None):
     Reuses the /api/recent cache when the entry already has extended fields (fg_pct, matchup).
     Falls back to a fresh PlayerGameLog fetch otherwise.
     """
+    def _to_iso(d):
+        """Normalize 'May 06, 2026' or 'MAY 06, 2026' to '2026-05-06'."""
+        try:
+            return pd.to_datetime(str(d), errors="coerce").strftime("%Y-%m-%d")
+        except Exception:
+            return str(d)
+
     def _find(gl, ds):
         if ds:
-            return next((g for g in gl if g.get("date", "").startswith(ds)), None)
+            return next((g for g in gl if _to_iso(g.get("date", "")) == ds), None)
         return gl[0] if gl else None
 
     # Try cache first
