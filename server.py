@@ -22,7 +22,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.5-live"  # +dynamic injuries (live boxscore + GTD softener)
+SERVER_VERSION = "v6.5.1-live"  # Adj 13 reads effective injury map (no phantom cascades)
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1704,15 +1704,26 @@ def post_project():
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 13 — INJURY CASCADE (teammate OUT → usage boost; own GTD → penalty)
-    # Uses _INJURY_OVERRIDES to detect confirmed OUT teammates on the same team.
+    # v6.5.1: Reads from _build_effective_injury_map() instead of static
+    # _INJURY_OVERRIDES — so live boxscore clears (auto-cleared playing players)
+    # and GTD streak softeners propagate into cascade math correctly. Without
+    # this, a player listed in _INJURY_OVERRIDES but auto-cleared by live
+    # boxscore would still trigger phantom cascades for their teammates.
+    #
     # Freed usage (PPG) redistributes proportionally to remaining players' USG%.
     # This is the #1 real-world edge: sportsbooks are slow to update lines for DNPs.
     #   • Teammate OUT with ≥8 PPG → proportional boost (cap +15%)
     #   • Player themselves is Questionable/Doubtful → conservative -8% penalty
     # ─────────────────────────────────────────────────────────────────────────
     inj_cascade_pct = 0.0
-    own_inj = (_INJURY_OVERRIDES.get(resolved_name)
-               or _INJURY_OVERRIDES.get(player_name)
+    try:
+        effective_inj_map, _ = _build_effective_injury_map()
+    except Exception as e:
+        logging.warning("effective_injury_map failed, falling back to overrides: %s", e)
+        effective_inj_map = dict(_INJURY_OVERRIDES)
+
+    own_inj = (effective_inj_map.get(resolved_name)
+               or effective_inj_map.get(player_name)
                or {})
     if own_inj.get("status") in ("Questionable", "Doubtful"):
         inj_cascade_pct = -0.08
@@ -1744,10 +1755,16 @@ def post_project():
         for tname, tdata in full_players.items():
             if tdata.get("team") != own_team or tname == resolved_name:
                 continue
-            t_inj  = _INJURY_OVERRIDES.get(tname) or {}
+            # v6.5.1: read from effective map (live boxscore + ESPN + overrides),
+            # not raw _INJURY_OVERRIDES. Auto-cleared players don't trigger cascade.
+            t_inj  = effective_inj_map.get(tname) or {}
             t_usg  = float(tdata.get("po", {}).get("usg") or tdata.get("rs", {}).get("usg") or 0)
             t_stat = float(tdata.get("po", {}).get(stat_key) or tdata.get("rs", {}).get(stat_key) or 0)
-            if t_inj.get("status") == "Out" and t_stat >= thresh:
+            # Status from /api/injuries can be "Out", "Out For Season", etc. — match
+            # any string starting with "out" (case-insensitive) so live source labels
+            # like "nba_live_inactive" with status "Out" match correctly.
+            t_status = (t_inj.get("status") or "").strip().lower()
+            if t_status.startswith("out") and t_stat >= thresh:
                 teammates_out.append({"name": tname, stat_lbl: t_stat, "usg": t_usg})
             else:
                 remaining_usg += t_usg
@@ -2437,10 +2454,20 @@ def _gtd_played_streak(player_name):
     return (played, len(last5))
 
 
-@app.route("/api/injuries")
-def get_injuries():
+_EFFECTIVE_INJURY_TTL = 60  # 1-minute cache for the fully-merged map
+
+
+def _build_effective_injury_map():
     """
-    Dynamic injury report (v6.5-live).
+    Build the FULLY-MERGED, dynamic injury map.
+
+    This is the single source of truth used by:
+      • /api/injuries  (response payload)
+      • Adj 13         (injury cascade math during projection)
+
+    Without this, Adj 13 was reading raw _INJURY_OVERRIDES — which meant
+    a player auto-cleared by live boxscore was still triggering teammate
+    cascades. Now both consumers see the same effective state.
 
     Source priority (most authoritative wins):
       1. live_boxscore.INACTIVE      → forced OUT
@@ -2451,8 +2478,15 @@ def get_injuries():
       6. _INJURY_OVERRIDES           → static gap-fill for confirmed long-term outs
       7. GTD streak softener         → downgrade Questionable → Probable when 4/5 played
 
-    All entries carry `source` so the client can show provenance.
+    Returns (merged_dict, diagnostics_dict).
+    Cached 60 seconds (boxscores tick fast on game day).
     """
+    cache_key = "_effective_injury_map"
+    with _cache_lock:
+        entry = _cache.get(cache_key)
+        if entry and (time.time() - entry["ts"]) < _EFFECTIVE_INJURY_TTL:
+            return entry["data"]
+
     merged = {}
     diag = {"espn_loaded": 0, "live_in": 0, "live_out": 0,
             "live_playing": 0, "auto_cleared": [], "gtd_softened": []}
@@ -2541,6 +2575,19 @@ def get_injuries():
                     "name": name, "played_l5": played, "of": total,
                 })
 
+    result = (merged, diag)
+    with _cache_lock:
+        _cache[cache_key] = {"data": result, "ts": time.time()}
+    return result
+
+
+@app.route("/api/injuries")
+def get_injuries():
+    """
+    Public injury endpoint — returns the dynamic merged map plus diagnostics.
+    Backed by _build_effective_injury_map() which is also consumed by Adj 13.
+    """
+    merged, diag = _build_effective_injury_map()
     return jsonify({
         "success":     True,
         "injuries":    merged,
