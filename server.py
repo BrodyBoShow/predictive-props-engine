@@ -11,7 +11,7 @@ from nba_api.stats.endpoints import (
     leaguedashptstats,
     playergamelog,
 )
-from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
+from nba_api.live.nba.endpoints import scoreboard as live_scoreboard, boxscore as live_boxscore
 from nba_api.stats.static import teams as nba_teams_static
 from datetime import datetime, timezone, timedelta
 import pandas as pd
@@ -22,7 +22,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.4-ctx"  # +context-aware Adj 14 residual bucketing
+SERVER_VERSION = "v6.5-live"  # +dynamic injuries (live boxscore + GTD softener)
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2267,17 +2267,197 @@ def get_schedule():
     })
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DYNAMIC INJURY DETECTION (v6.5-live)
+# ─────────────────────────────────────────────────────────────────────────────
+# Three new live sources stack on top of ESPN + overrides:
+#
+#   1. _live_boxscore_status()  — NBA's official live boxscore feed.
+#      Once a game's pregame inactive list posts (~1hr before tip), every
+#      player carries an explicit status: ACTIVE / INACTIVE. Plus during
+#      the game, `played` and `oncourt` flags tell us who has minutes.
+#      → AUTHORITATIVE: an INACTIVE in the boxscore is officially OUT.
+#      → AUTHORITATIVE: minutes>0 means they're playing (auto-clear).
+#
+#   2. _gtd_played_streak()  — uses /api/recent cache.
+#      If a "Questionable" / "Day-To-Day" player has logged minutes in
+#      4+ of their last 5 games, soften status to "Probable" with note.
+#
+#   3. ESPN live + static overrides  — kept as fallback for players not
+#      yet covered by today's boxscore (gives lead-time on injuries that
+#      surface earlier in the day before the inactive list posts).
+#
+# Priority (most authoritative wins):
+#   live_boxscore_INACTIVE > live_boxscore_minutes>0 (OUT vs ACTIVE)
+#                          > played_today
+#                          > _CLEARED_PLAYERS (manual)
+#                          > GTD streak softener
+#                          > ESPN live
+#                          > _INJURY_OVERRIDES (gap-fill)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LIVE_INJURY_TTL = 60  # 1-minute TTL — boxscore changes fast on game day
+
+
+def _parse_minutes_str(m):
+    """Parse 'PT15M30.00S' → 15.5 minutes. Handles missing/empty inputs."""
+    if not m or not isinstance(m, str):
+        return 0.0
+    try:
+        if m.startswith("PT"):
+            m = m[2:]
+        mins = 0.0
+        if "M" in m:
+            ms, m = m.split("M", 1)
+            mins = float(ms or 0)
+        if "S" in m:
+            ss = m.split("S")[0]
+            mins += float(ss or 0) / 60.0
+        return mins
+    except Exception:
+        return 0.0
+
+
+def _live_boxscore_status():
+    """
+    Walk every active live game's boxscore and bucket players by status.
+
+    Returns:
+        {
+            "playing_now":  set(name)  — minutes > 0 right now (definitively playing)
+            "active":       set(name)  — status=ACTIVE in pregame inactive list
+            "inactive":     {name: reason}  — status=INACTIVE / DNP / NWT
+            "team_of":      {name: team_abbr}
+        }
+
+    Cached 60 seconds (boxscores change fast during games).
+    Returns empty buckets if no live games or API fails.
+    """
+    cache_key = "_live_box_status"
+    with _cache_lock:
+        entry = _cache.get(cache_key)
+        if entry and (time.time() - entry["ts"]) < _LIVE_INJURY_TTL:
+            return entry["data"]
+
+    out = {"playing_now": set(), "active": set(), "inactive": {}, "team_of": {}}
+
+    # Step 1: get today's games via live scoreboard
+    try:
+        sb = live_scoreboard.ScoreBoard()
+        games = sb.get_dict().get("scoreboard", {}).get("games", [])
+    except Exception as e:
+        logging.warning("live_scoreboard fetch failed: %s", e)
+        games = []
+
+    # Step 2: for each game, pull boxscore (only if pregame inactives may have posted)
+    # gameStatus: 1=preGame, 2=inProgress, 3=final
+    for g in games:
+        gid = g.get("gameId")
+        gstatus = g.get("gameStatus", 0)
+        if not gid:
+            continue
+        # Skip games > 3 hours away (inactives haven't posted yet)
+        # gameStatus=1 means pregame; check if start is within 4 hours
+        if gstatus == 1:
+            try:
+                game_et = g.get("gameTimeUTC") or ""
+                # Cheap parse — accept any format; we just need to gate fetch
+                # If we can't parse, just try fetching anyway.
+                from datetime import datetime as _dt
+                gt = _dt.fromisoformat(game_et.replace("Z", "+00:00"))
+                hours_until = (gt - datetime.now(timezone.utc)).total_seconds() / 3600
+                if hours_until > 4:
+                    continue
+            except Exception:
+                pass
+
+        try:
+            bs = live_boxscore.BoxScore(game_id=gid)
+            bdata = bs.get_dict().get("game", {})
+        except Exception as e:
+            logging.warning("live boxscore fetch failed for %s: %s", gid, e)
+            continue
+
+        for side in ("homeTeam", "awayTeam"):
+            team = bdata.get(side, {}) or {}
+            tri  = team.get("teamTricode", "")
+            for p in (team.get("players") or []):
+                name   = (p.get("name") or "").strip().lower()
+                status = (p.get("status") or "").upper()
+                played = bool(p.get("played"))
+                stats  = p.get("statistics") or {}
+                mins   = _parse_minutes_str(stats.get("minutesCalculated") or stats.get("minutes"))
+                if not name:
+                    continue
+                if tri:
+                    out["team_of"][name] = tri
+
+                if status == "ACTIVE":
+                    out["active"].add(name)
+                    if played or mins > 0:
+                        out["playing_now"].add(name)
+                elif status in ("INACTIVE", "OUT", "DNP", "NWT"):
+                    # Reason: player notes if NBA provides them, else generic
+                    reason = p.get("notPlayingReason") or p.get("notPlayingDescription") or "Not active (NBA boxscore)"
+                    out["inactive"][name] = reason
+
+    with _cache_lock:
+        _cache[cache_key] = {"data": out, "ts": time.time()}
+
+    logging.info(
+        "live_boxscore_status: playing=%d active=%d inactive=%d (across %d games)",
+        len(out["playing_now"]), len(out["active"]), len(out["inactive"]), len(games),
+    )
+    return out
+
+
+def _gtd_played_streak(player_name):
+    """
+    Returns (games_played_in_last_5, total_recent_logged) or (0, 0) if no data.
+
+    Used to soften "Questionable" / "GTD" tags when a player has actually been
+    playing through the listed concern. We check the cached gameLog in the
+    /api/recent cache (per-PID) — no extra API hit.
+    """
+    players_data = (_cache_get("players") or {}).get("players", {})
+    p = players_data.get(player_name) or {}
+    pid = p.get("pid")
+    if not pid:
+        return (0, 0)
+
+    # Look up the cached recent payload (set by /api/recent endpoint)
+    recent_cache = _cache_get(f"recent_{pid}")
+    if not recent_cache:
+        return (0, 0)
+    log = recent_cache.get("gameLog") or []
+    if not log:
+        return (0, 0)
+    last5 = log[-5:]
+    played = sum(1 for g in last5 if (g.get("min") or 0) > 0)
+    return (played, len(last5))
+
+
 @app.route("/api/injuries")
 def get_injuries():
     """
-    Live injury report: ESPN public API enriched by static _INJURY_OVERRIDES.
-    Static overrides always win — they represent manually verified confirmed statuses.
-    ESPN adds any players not in the overrides (best-effort live enrichment).
-    Never returns AI-hallucinated data — ESPN or static only.
+    Dynamic injury report (v6.5-live).
+
+    Source priority (most authoritative wins):
+      1. live_boxscore.INACTIVE      → forced OUT
+      2. live_boxscore.PLAYING_NOW   → auto-clear (minutes > 0 right now)
+      3. live_boxscore.ACTIVE        → auto-clear (officially activated tonight)
+      4. _CLEARED_PLAYERS            → manual override of ESPN lag
+      5. ESPN live feed              → primary upcoming injuries
+      6. _INJURY_OVERRIDES           → static gap-fill for confirmed long-term outs
+      7. GTD streak softener         → downgrade Questionable → Probable when 4/5 played
+
+    All entries carry `source` so the client can show provenance.
     """
     merged = {}
+    diag = {"espn_loaded": 0, "live_in": 0, "live_out": 0,
+            "live_playing": 0, "auto_cleared": [], "gtd_softened": []}
 
-    # Try ESPN live injury feed first
+    # ── Layer 1: ESPN live injury feed (broadest coverage) ────────────────────
     try:
         url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -2293,31 +2473,81 @@ def get_injuries():
                 det       = entry.get("details") or {}
                 detail    = det.get("detail") or det.get("type") or status
                 if name and status:
-                    merged[name] = {
-                        "status": status, "detail": detail,
-                        "team": team, "source": "espn_live",
-                    }
+                    merged[name] = {"status": status, "detail": detail,
+                                    "team": team, "source": "espn_live"}
             except Exception:
                 continue
-        logging.info("ESPN injuries: loaded %d entries", len(merged))
+        diag["espn_loaded"] = len(merged)
+        logging.info("ESPN injuries: loaded %d", len(merged))
     except Exception as e:
-        logging.warning("ESPN injury fetch failed (using static only): %s", e)
+        logging.warning("ESPN injury fetch failed: %s", e)
 
-    # Gap-fill: static overrides only apply when ESPN has NO entry for this player.
-    # ESPN live data is the primary truth — overrides never clobber it.
+    # ── Layer 2: static overrides (gap-fill where ESPN has nothing) ───────────
     for name, info in _INJURY_OVERRIDES.items():
         if name not in merged:
             merged[name] = {**info, "source": "override"}
 
-    # Remove players confirmed active — clears ESPN lag for returning players.
+    # ── Layer 3: live boxscore — most authoritative source on game day ────────
+    live = _live_boxscore_status()
+    diag["live_in"]      = len(live["active"])
+    diag["live_out"]     = len(live["inactive"])
+    diag["live_playing"] = len(live["playing_now"])
+
+    # 3a. Boxscore says INACTIVE → force OUT (overrides any softer status)
+    for name, reason in live["inactive"].items():
+        prev = merged.get(name) or {}
+        merged[name] = {
+            "status": "Out",
+            "detail": reason,
+            "team":   live["team_of"].get(name, prev.get("team", "")),
+            "source": "nba_live_inactive",
+            "supersedes": prev.get("source") if prev else None,
+        }
+
+    # 3b. Boxscore minutes > 0 → player is literally on the floor → auto-clear
+    for name in live["playing_now"]:
+        if name in merged:
+            diag["auto_cleared"].append({"name": name, "reason": "playing_now"})
+            merged.pop(name, None)
+
+    # 3c. Boxscore status=ACTIVE (pregame inactive list posted, player not on it)
+    for name in live["active"]:
+        if name in merged and name not in live["inactive"]:
+            diag["auto_cleared"].append({"name": name, "reason": "boxscore_active"})
+            merged.pop(name, None)
+
+    # ── Layer 4: manual cleared list (ESPN lag protection) ────────────────────
     for name in _CLEARED_PLAYERS:
-        merged.pop(name, None)
+        if name in merged:
+            diag["auto_cleared"].append({"name": name, "reason": "manual_clear"})
+            merged.pop(name, None)
+
+    # ── Layer 5: GTD streak softener ──────────────────────────────────────────
+    # If a player is Questionable but has played 4 of last 5, downgrade to
+    # Probable. Doesn't remove the entry — just lowers Adj 13's penalty.
+    for name in list(merged.keys()):
+        info = merged[name]
+        s = (info.get("status") or "").lower()
+        if "questionable" in s or "day-to-day" in s or "gtd" in s:
+            played, total = _gtd_played_streak(name)
+            if played >= 4 and total >= 5:
+                merged[name] = {
+                    **info,
+                    "status": "Probable",
+                    "detail": f"{info.get('detail','')} (softened — played {played}/{total} recent)".strip(),
+                    "source": (info.get("source") or "") + "+streak_softened",
+                }
+                diag["gtd_softened"].append({
+                    "name": name, "played_l5": played, "of": total,
+                })
 
     return jsonify({
-        "success":  True,
-        "injuries": merged,
-        "count":    len(merged),
-        "updated":  datetime.now(timezone.utc).strftime("%b %-d, %-I:%M %p ET"),
+        "success":     True,
+        "injuries":    merged,
+        "count":       len(merged),
+        "updated":     datetime.now(timezone.utc).strftime("%b %-d, %-I:%M %p ET"),
+        "diagnostics": diag,
+        "version":     SERVER_VERSION,
     })
 
 
@@ -2503,19 +2733,29 @@ def _game_log_array(df):
 
 @app.route("/api/recent/<int:player_id>")
 def get_recent(player_id):
+    # Cache by PID for 30 minutes — game logs only change when a new game finishes.
+    # The injury endpoint's GTD streak softener also reads from this cache.
+    cache_key = f"recent_{player_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         logs = playergamelog.PlayerGameLog(
             player_id=player_id, season=SEASON, season_type_all_star="Playoffs",
         ).get_data_frames()[0]
         if logs.empty:
-            return {"success": True, "recent": None, "gp": 0, "gameLog": []}
+            payload = {"success": True, "recent": None, "gp": 0, "gameLog": []}
+            _cache_set(cache_key, payload)
+            return payload
         recent = logs.head(5)
-        return {
+        payload = {
             "success": True,
             "recent":  _game_log_avg(recent),
             "gp":      len(recent),
             "gameLog": _game_log_array(recent),  # per-game array for variance band
         }
+        _cache_set(cache_key, payload)
+        return payload
     except Exception as e:
         logging.error("Error fetching recent: %s", e)
         return {"success": False, "error": str(e)}, 500
