@@ -22,7 +22,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.5.1-live"  # Adj 13 reads effective injury map (no phantom cascades)
+SERVER_VERSION = "v6.6-perf"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -74,7 +74,30 @@ app = Flask(__name__)
 CORS(app)
 
 SEASON = "2025-26"
-_CACHE_TTL = 3600  # 1 hour
+_CACHE_TTL = 3600  # 1 hour (default; see _dynamic_ttl for time-aware values)
+
+
+def _dynamic_ttl(base_seconds=3600):
+    """
+    Return TTL adjusted for time-of-day. Stats don't change overnight, so we
+    can hold cache much longer when nothing's happening.
+
+      02:00–14:00 ET (dead window)  → 4× base (4 hours default)
+      14:00–18:00 ET (pregame)      → 1× base (1 hour default)
+      18:00–02:00 ET (game time)    → 0.5× base (30 min default)
+
+    Slashes external API hits during the long quiet stretches without ever
+    going stale near tipoff. Any caller can override base_seconds.
+    """
+    try:
+        et_hour = datetime.now(timezone(timedelta(hours=-4))).hour
+    except Exception:
+        return base_seconds
+    if 2 <= et_hour < 14:
+        return int(base_seconds * 4)
+    if 14 <= et_hour < 18:
+        return int(base_seconds)
+    return max(60, int(base_seconds * 0.5))
 
 # ── In-memory cache ───────────────────────────────────────────────────────────
 _cache: dict = {}
@@ -85,11 +108,19 @@ _cache_lock = threading.Lock()
 _warmup_done = threading.Event()
 
 
-def _cache_get(key):
+def _cache_get(key, ttl=None):
+    """
+    Cache lookup with time-aware TTL.
+    Pass `ttl` for per-call override; otherwise uses _dynamic_ttl(_CACHE_TTL)
+    which extends to 4 hours during dead overnight hours and tightens to
+    30 min near tipoff.
+    """
+    effective_ttl = ttl if ttl is not None else _dynamic_ttl(_CACHE_TTL)
     with _cache_lock:
         entry = _cache.get(key)
-        if entry and (time.time() - entry["ts"]) < _CACHE_TTL:
-            logging.info("Cache HIT: %s (age %.0fs)", key, time.time() - entry["ts"])
+        if entry and (time.time() - entry["ts"]) < effective_ttl:
+            logging.info("Cache HIT: %s (age %.0fs, ttl %ds)",
+                         key, time.time() - entry["ts"], effective_ttl)
             return entry["data"]
     return None
 
@@ -2054,7 +2085,20 @@ def _fetch_espn_games(date_yyyymmdd, et_label_for_today=None):
 
     date_yyyymmdd: 'YYYYMMDD' format (e.g., '20260503')
     Returns list of normalized game dicts. Returns [] safely on any error.
+
+    CACHED: per-date, 10 min TTL during pregame/gametime, 1 hour during
+    dead overnight hours (via _dynamic_ttl). The schedule endpoint is
+    polled every 5 min by the frontend — without this cache, every poll
+    hit ESPN twice (today + upcoming). Now hits ESPN ~once per 10 min
+    per date, regardless of how many users refresh.
     """
+    cache_key = f"espn_scoreboard_{date_yyyymmdd}"
+    # ESPN scoreboard for a given date is stable in 10-min chunks during the
+    # day; overnight it's totally stable. Use dynamic TTL with 600s base.
+    cached = _cache_get(cache_key, ttl=_dynamic_ttl(600))
+    if cached is not None:
+        return cached
+
     url = (f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
            f"scoreboard?dates={date_yyyymmdd}")
     try:
@@ -2063,6 +2107,8 @@ def _fetch_espn_games(date_yyyymmdd, et_label_for_today=None):
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         logging.warning("ESPN fetch failed for %s: %s", date_yyyymmdd, e)
+        # Cache the empty result briefly to avoid hammering on transient ESPN errors
+        _cache_set(cache_key, [])
         return []
 
     games = []
@@ -2148,6 +2194,7 @@ def _fetch_espn_games(date_yyyymmdd, et_label_for_today=None):
             logging.warning("Skipping malformed ESPN event: %s", e)
             continue
 
+    _cache_set(cache_key, games)
     return games
 
 
@@ -2810,6 +2857,18 @@ def get_recent(player_id):
 
 @app.route("/api/vs-opponent/<int:player_id>/<opp_abbr>")
 def get_vs_opponent(player_id, opp_abbr):
+    """
+    Player's historical performance vs a specific opponent (PO + RS).
+    CACHED per (pid, opp) — historical matchups only change when a new
+    game completes vs that opponent (~once per series). Default dynamic
+    TTL is fine: 4hr overnight, 30min near tipoff. Slate of 20 players
+    against the same opponent now hits NBA API once per player instead
+    of every page load.
+    """
+    cache_key = f"vsopp_{player_id}_{opp_abbr.upper()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         po_logs = playergamelog.PlayerGameLog(
             player_id=player_id, season=SEASON, season_type_all_star="Playoffs",
@@ -2828,9 +2887,13 @@ def get_vs_opponent(player_id, opp_abbr):
             source = "PO+RS" if not po_logs.empty else "RS"
 
         if vs.empty:
-            return {"success": True, "vsOpponent": None, "gp": 0, "source": None}
+            payload = {"success": True, "vsOpponent": None, "gp": 0, "source": None}
+            _cache_set(cache_key, payload)
+            return payload
 
-        return {"success": True, "vsOpponent": _game_log_avg(vs), "gp": len(vs), "source": source}
+        payload = {"success": True, "vsOpponent": _game_log_avg(vs), "gp": len(vs), "source": source}
+        _cache_set(cache_key, payload)
+        return payload
     except Exception as e:
         logging.error("Error fetching vs-opponent: %s", e)
         return {"success": False, "error": str(e)}, 500
