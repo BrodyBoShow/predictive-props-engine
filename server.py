@@ -107,6 +107,19 @@ _cache_lock = threading.Lock()
 # or fast-failing with 503 — whichever the warmup finishes first.
 _warmup_done = threading.Event()
 
+def _keep_alive():
+       import os
+       port = os.environ.get("PORT", "10000")
+       time.sleep(300)
+       while True:
+           try:
+               urllib.request.urlopen(f"http://localhost:{port}/api/health", timeout=10)
+               logging.info("Keep-alive ping sent")
+           except Exception as e:
+               logging.warning("Keep-alive ping failed: %s", e)
+           time.sleep(600)
+
+   threading.Thread(target=_keep_alive, daemon=True).start()
 
 def _cache_get(key, ttl=None):
     """
