@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.2-xgb-pinned"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.9.3-xgb-diagnostics"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -89,6 +89,7 @@ _CACHE_TTL = 3600  # 1 hour (default; see _dynamic_ttl for time-aware values)
 # Populated by _load_xgb_models() during warmup. Keys: "pts", "reb", "ast".
 _XGB_MODELS: dict = {}
 _XGB_META:   dict = {}   # feature_cols + medians loaded from model_meta.json
+_XGB_LOAD_ERRORS: dict = {}  # prop -> error string for diagnostics
 
 _XGB_PROP_MAP = {
     "points":     "pts",
@@ -126,7 +127,10 @@ def _load_xgb_models():
             _XGB_MODELS[prop] = m
             loaded.append(prop)
         except Exception as e:
-            logging.error("XGB %s model load failed: %s", prop, e)
+            import traceback
+            err = f"{type(e).__name__}: {e}"
+            _XGB_LOAD_ERRORS[prop] = err
+            logging.error("XGB %s model load failed: %s\n%s", prop, err, traceback.format_exc())
 
     logging.info("XGBoost models loaded: %s (xgb v%s)",
                  loaded or "none", getattr(_xgb_lib, "__version__", "?"))
@@ -2905,9 +2909,27 @@ def get_version():
 def model_status():
     """Report which XGBoost models are loaded and ready for inference."""
     meta_val = _XGB_META.get("validation_results", {})
+    xgb_ver = "?"
+    try:
+        if _xgb_lib:
+            xgb_ver = _xgb_lib.__version__
+    except Exception:
+        pass
+    # List the model files we expect
+    file_check = {}
+    for prop in ("pts", "reb", "ast"):
+        path = os.path.join(os.path.dirname(__file__), f"xgb_{prop}_model.json")
+        try:
+            file_check[prop] = {"path": path, "exists": os.path.exists(path),
+                                "size": os.path.getsize(path) if os.path.exists(path) else 0}
+        except Exception as e:
+            file_check[prop] = {"path": path, "error": str(e)}
     return jsonify({
         "xgb_available":    _XGB_AVAILABLE,
+        "xgb_version":      xgb_ver,
         "models_loaded":    list(_XGB_MODELS.keys()),
+        "load_errors":      _XGB_LOAD_ERRORS,
+        "file_check":       file_check,
         "feature_cols":     _XGB_META.get("feature_cols", []),
         "train_seasons":    _XGB_META.get("train_seasons", []),
         "val_seasons":      _XGB_META.get("val_seasons", []),
