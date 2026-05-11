@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.9-xgb-debug"  # +xgb debug fields to diagnose guardrail
+SERVER_VERSION = "v6.9.10-xgb-cache-keys"  # fix ppg/rpg/apg key names in XGB feature builder
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1338,9 +1338,9 @@ def _build_xgb_features(
     All values are best-effort from warm caches — None means imputed at inference.
     """
     # L5 averages — prefer client-sent L5 (already computed from /api/recent)
-    l5_pts = float(l5_avg)  if l5_avg is not None else float(po.get("pts") or 0) or None
-    l5_reb = float(po.get("reb") or 0) or None
-    l5_ast = float(po.get("ast") or 0) or None
+    l5_pts = float(l5_avg)  if l5_avg is not None else float(po.get("ppg") or po.get("pts") or 0) or None
+    l5_reb = float(po.get("rpg") or po.get("reb") or 0) or None
+    l5_ast = float(po.get("apg") or po.get("ast") or 0) or None
     l5_min_v = float(l5_min) if l5_min is not None else float(po.get("min") or 0) or None
 
     # L5 TS% from scoring cache
@@ -1363,9 +1363,10 @@ def _build_xgb_features(
             pass
 
     # Season-to-date from RS (larger sample than PO early in series)
-    std_pts = float(rs.get("pts") or po.get("pts") or 0) or None
-    std_reb = float(rs.get("reb") or po.get("reb") or 0) or None
-    std_ast = float(rs.get("ast") or po.get("ast") or 0) or None
+    # RS cache uses ppg/rpg/apg; PO cache also uses ppg/rpg/apg
+    std_pts = float(rs.get("ppg") or rs.get("pts") or po.get("ppg") or po.get("pts") or 0) or None
+    std_reb = float(rs.get("rpg") or rs.get("reb") or po.get("rpg") or po.get("reb") or 0) or None
+    std_ast = float(rs.get("apg") or rs.get("ast") or po.get("apg") or po.get("ast") or 0) or None
     std_min = float(rs.get("min") or po.get("min") or 0) or None
 
     gp_prior = int(po.get("gp") or rs.get("gp") or 0)
