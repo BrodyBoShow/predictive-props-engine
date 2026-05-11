@@ -19,7 +19,13 @@ Outputs (in the same directory):
 """
 
 import json
+import sys
 import numpy as np
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import mean_squared_error, mean_absolute_error

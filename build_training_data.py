@@ -22,6 +22,12 @@ import json
 import pandas as pd
 import numpy as np
 
+# Force UTF-8 output so Windows cp1252 console doesn't choke on Unicode in print/errors
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 try:
     from nba_api.stats.endpoints import leaguegamelog
 except ImportError:
@@ -122,8 +128,8 @@ def _per_player(grp: pd.DataFrame) -> pd.DataFrame:
     ]:
         grp[feat] = _expanding_prior(grp[col])
 
-    # Games played BEFORE this game in the current season
-    grp["gp_prior"] = range(len(grp))  # 0,1,2,… after sort within player-season group
+    # Games played BEFORE this game in the current season (resets each season)
+    grp["gp_prior"] = grp.groupby("season").cumcount()
 
     return grp
 
@@ -197,13 +203,11 @@ def main():
     opp_lookup = tg[["GAME_ID", "TEAM_ABBREVIATION", "opp_def_roll10", "opp_pace_roll10"]].copy()
 
     # ── 4. Per-player rolling features ────────────────────────────────────────
-    # Group by player+season so gp_prior resets each season
+    # Explicit loop avoids pandas 2.x groupby/apply key-dropping behaviour.
     print("Computing per-player rolling features…")
-    raw = (
-        raw.groupby(["PLAYER_ID", "season"], group_keys=False)
-        .apply(_per_player)
-        .reset_index(drop=True)
-    )
+    raw = raw.sort_values(["PLAYER_ID", "GAME_DATE"]).reset_index(drop=True)
+    pieces = [_per_player(grp) for _, grp in raw.groupby("PLAYER_ID")]
+    raw = pd.concat(pieces, ignore_index=True)
 
     # ── 5. Join opponent context ───────────────────────────────────────────────
     raw = raw.merge(opp_lookup, on=["GAME_ID", "TEAM_ABBREVIATION"], how="left")

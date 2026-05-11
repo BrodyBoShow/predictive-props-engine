@@ -1,0 +1,70 @@
+{
+  "feature_cols": [
+    "l5_pts",
+    "l5_reb",
+    "l5_ast",
+    "l5_min",
+    "l5_usg",
+    "l5_ts",
+    "l10_pts_std",
+    "l10_min_std",
+    "std_pts",
+    "std_reb",
+    "std_ast",
+    "std_min",
+    "gp_prior",
+    "is_home",
+    "rest_days",
+    "opp_def_roll10",
+    "opp_pace_roll10"
+  ],
+  "medians": {
+    "l5_pts": 9.4,
+    "l5_reb": 3.6,
+    "l5_ast": 1.8,
+    "l5_min": 24.2,
+    "l5_usg": 9.152,
+    "l5_ts": 0.5703488372093024,
+    "l10_pts_std": 5.125101625008675,
+    "l10_min_std": 5.344779384283945,
+    "std_pts": 9.090909090909092,
+    "std_reb": 3.628099173553719,
+    "std_ast": 1.6829268292682926,
+    "std_min": 23.4375,
+    "gp_prior": 33.0,
+    "is_home": 1.0,
+    "rest_days": 2.0,
+    "opp_def_roll10": 114.2,
+    "opp_pace_roll10": 88.5
+  },
+  "validation_results": {
+    "pts": {
+      "rmse": 6.096128341965804,
+      "mae": 4.6691436767578125,
+      "within_3": 0.41096593376228635,
+      "best_iteration": 329,
+      "model_file": "xgb_pts_model.json"
+    },
+    "reb": {
+      "rmse": 2.540204070296322,
+      "mae": 1.9232186079025269,
+      "within_3": 0.8044447953262543,
+      "best_iteration": 344,
+      "model_file": "xgb_reb_model.json"
+    },
+    "ast": {
+      "rmse": 1.8344854578298007,
+      "mae": 1.3538743257522583,
+      "within_3": 0.9058540243950578,
+      "best_iteration": 384,
+      "model_file": "xgb_ast_model.json"
+    }
+  },
+  "train_seasons": [
+    "2022-23",
+    "2023-24"
+  ],
+  "val_seasons": [
+    "2024-25"
+  ]
+}
