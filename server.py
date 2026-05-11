@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.6-xgb-guardrail"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.9.7-xgb-fga-fix"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1350,18 +1350,14 @@ def _build_xgb_features(
         if ts is not None:
             l5_ts = float(ts)
 
-    # l5_usg = FGA per game (after retrain with FGA-based feature).
-    # Use scoring_row fga if available, else estimate from pts and TS%.
+    # l5_usg = FGA per game (training feature = FGA from game log).
+    # Estimate from po TS% and pts: FGA ≈ pts / (2 * TS%).
+    # po.get("ts") is the season TS% (0–1 scale), po.get("pts") is PPG.
     l5_usg = None
-    if scoring_row:
-        fga = scoring_row.get("fga") or scoring_row.get("fgaPerGame")
-        if fga is not None:
-            l5_usg = float(fga)
-    if l5_usg is None and l5_pts and l5_ts and l5_ts > 0:
-        # Rough estimate: pts ≈ 2 * TS% * FGA  →  FGA ≈ pts / (2 * TS%)
-        ts_frac = l5_ts / 100.0 if l5_ts > 1 else l5_ts
-        if ts_frac > 0.2:
-            l5_usg = round(l5_pts / (2 * ts_frac), 1)
+    po_ts  = po.get("ts") or rs.get("ts")
+    po_pts = l5_pts or float(po.get("pts") or 0)
+    if po_ts and po_ts > 0.2 and po_pts:
+        l5_usg = round(po_pts / (2 * float(po_ts)), 1)
 
     # L10 volatility — std of the L5 values passed by client
     l10_pts_std = None
