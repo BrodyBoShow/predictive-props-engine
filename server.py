@@ -1,5 +1,6 @@
 import math
 import random
+import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from nba_api.stats.endpoints import (
@@ -22,7 +23,15 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.8-box-date-fix"  # +ESPN/vs-opp caching, dynamic TTL by hour
+# XGBoost — optional; falls back to multiplier model if not installed / models absent
+try:
+    import xgboost as _xgb_lib
+    _XGB_AVAILABLE = True
+except ImportError:
+    _xgb_lib      = None
+    _XGB_AVAILABLE = False
+
+SERVER_VERSION = "v6.9-xgb-inference"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -75,6 +84,47 @@ CORS(app)
 
 SEASON = "2025-26"
 _CACHE_TTL = 3600  # 1 hour (default; see _dynamic_ttl for time-aware values)
+
+# ── XGBoost model registry ────────────────────────────────────────────────────
+# Populated by _load_xgb_models() during warmup. Keys: "pts", "reb", "ast".
+_XGB_MODELS: dict = {}
+_XGB_META:   dict = {}   # feature_cols + medians loaded from model_meta.json
+
+_XGB_PROP_MAP = {
+    "points":     "pts",
+    "rebounds":   "reb",
+    "assists":    "ast",
+    "pra":        None,  # composite — handled separately
+    "pa":         None,
+    "pr":         None,
+}
+
+def _load_xgb_models():
+    """Load trained XGBoost model files and metadata from disk into memory."""
+    global _XGB_MODELS, _XGB_META
+    if not _XGB_AVAILABLE:
+        logging.info("XGBoost not installed — running multiplier-only mode.")
+        return
+
+    meta_path = os.path.join(os.path.dirname(__file__), "model_meta.json")
+    if not os.path.exists(meta_path):
+        logging.info("model_meta.json not found — XGBoost inference disabled.")
+        return
+
+    with open(meta_path) as f:
+        _XGB_META = json.load(f)
+
+    loaded = []
+    for prop in ("pts", "reb", "ast"):
+        model_path = os.path.join(os.path.dirname(__file__), f"xgb_{prop}_model.json")
+        if not os.path.exists(model_path):
+            continue
+        m = _xgb_lib.XGBRegressor()
+        m.load_model(model_path)
+        _XGB_MODELS[prop] = m
+        loaded.append(prop)
+
+    logging.info("XGBoost models loaded: %s", loaded or "none")
 
 
 def _dynamic_ttl(base_seconds=3600):
@@ -766,6 +816,12 @@ def _warmup():
             _sleep()
         except Exception as e:
             logging.error("Warm-up failed for %s: %s", cache_key, e)
+    # Load XGBoost models after all caches are warm
+    try:
+        _load_xgb_models()
+    except Exception as e:
+        logging.error("XGBoost model load failed: %s", e)
+
     _warmup_done.set()
     logging.info("Warm-up complete — all endpoints cached and ready.")
 
@@ -1215,6 +1271,138 @@ def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
     return base, False   # use_rate_base=False → caller lets Adj 5 fire normally
 
 
+def _xgb_predict(prop_key: str, feature_vals: dict) -> float | None:
+    """
+    Run XGBoost inference for one player-game.
+
+    Args:
+        prop_key:     "pts" | "reb" | "ast"
+        feature_vals: dict of raw feature values (may contain None/NaN)
+
+    Returns:
+        float prediction, or None if model unavailable / features insufficient.
+    """
+    model = _XGB_MODELS.get(prop_key)
+    if model is None or not _XGB_META:
+        return None
+
+    feature_cols = _XGB_META.get("feature_cols", [])
+    medians      = _XGB_META.get("medians", {})
+
+    row = []
+    for col in feature_cols:
+        val = feature_vals.get(col)
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            val = medians.get(col, 0.0)
+        row.append(float(val))
+
+    if not row:
+        return None
+
+    try:
+        df_row = pd.DataFrame([row], columns=feature_cols)
+        pred   = float(model.predict(df_row)[0])
+        return max(0.0, round(pred, 2))
+    except Exception as e:
+        logging.warning("XGBoost predict failed (%s/%s): %s", prop_key, feature_vals.get("l5_pts"), e)
+        return None
+
+
+def _build_xgb_features(
+    player: dict,
+    po: dict,
+    rs: dict,
+    scoring_row: dict | None,
+    tracking_row: dict | None,
+    opp_def: dict | None,
+    own_team_data: dict | None,
+    opp_team_data: dict | None,
+    l5_avg: float | None,
+    l5_min: float | None,
+    l5_stat_values: list,
+    rest_days: int | None,
+    is_home: bool | None,
+) -> dict:
+    """
+    Assemble the feature vector matching the training pipeline columns.
+    All values are best-effort from warm caches — None means imputed at inference.
+    """
+    # L5 averages — prefer client-sent L5 (already computed from /api/recent)
+    l5_pts = float(l5_avg)  if l5_avg is not None else float(po.get("pts") or 0) or None
+    l5_reb = float(po.get("reb") or 0) or None
+    l5_ast = float(po.get("ast") or 0) or None
+    l5_min_v = float(l5_min) if l5_min is not None else float(po.get("min") or 0) or None
+
+    # L5 TS% from scoring cache
+    l5_ts = None
+    if scoring_row:
+        ts = scoring_row.get("tsPct") or scoring_row.get("ts_pct")
+        if ts is not None:
+            l5_ts = float(ts)
+
+    # L5 usage proxy from tracking (USG% direct if available)
+    l5_usg = None
+    if tracking_row:
+        usg = tracking_row.get("usgPct") or tracking_row.get("usg_pct")
+        if usg is not None:
+            l5_usg = float(usg)
+
+    # L10 volatility — std of the L5 values passed by client
+    l10_pts_std = None
+    l10_min_std = None
+    if l5_stat_values and len(l5_stat_values) >= 3:
+        try:
+            vals        = [float(v) for v in l5_stat_values if v is not None]
+            l10_pts_std = float(np.std(vals)) if vals else None
+        except Exception:
+            pass
+
+    # Season-to-date from RS (larger sample than PO early in series)
+    std_pts = float(rs.get("pts") or po.get("pts") or 0) or None
+    std_reb = float(rs.get("reb") or po.get("reb") or 0) or None
+    std_ast = float(rs.get("ast") or po.get("ast") or 0) or None
+    std_min = float(rs.get("min") or po.get("min") or 0) or None
+
+    gp_prior = int(po.get("gp") or rs.get("gp") or 0)
+
+    # Venue / rest
+    is_home_v  = int(bool(is_home)) if is_home is not None else None
+    rest_days_v = int(rest_days) if rest_days is not None else None
+
+    # Opponent defensive proxy — pts allowed rolling avg
+    opp_def_roll10  = None
+    opp_pace_roll10 = None
+    if opp_def:
+        # team_defense cache stores oppPtsAllowed or dRtg-style metrics
+        pts_allowed = opp_def.get("oppPtsAllowed") or opp_def.get("pts_allowed")
+        if pts_allowed is not None:
+            opp_def_roll10 = float(pts_allowed)
+    if opp_team_data:
+        pace = opp_team_data.get("pace") or opp_team_data.get("PACE")
+        if pace is not None:
+            opp_pace_roll10 = float(pace)
+
+    return {
+        "l5_pts":        l5_pts,
+        "l5_reb":        l5_reb,
+        "l5_ast":        l5_ast,
+        "l5_min":        l5_min_v,
+        "l5_usg":        l5_usg,
+        "l5_ts":         l5_ts,
+        "l10_pts_std":   l10_pts_std,
+        "l10_min_std":   l10_min_std,
+        "std_pts":       std_pts,
+        "std_reb":       std_reb,
+        "std_ast":       std_ast,
+        "std_min":       std_min,
+        "gp_prior":      gp_prior,
+        "is_home":       is_home_v,
+        "rest_days":     rest_days_v,
+        "opp_def_roll10": opp_def_roll10,
+        "opp_pace_roll10": opp_pace_roll10,
+    }
+
+
 @app.route("/api/project", methods=["POST"])
 def post_project():
     """
@@ -1301,6 +1489,44 @@ def post_project():
     drivers   = []
     breakdown = {}
     breakdown["use_rate_base"] = use_rate_base
+
+    # ── XGBoost base override (replaces Adj 1-13 when models are loaded) ─────
+    # When trained model files exist, use ML prediction as the starting point
+    # instead of the sequential multiplier cascade. Residual calibration (Adj 14)
+    # still fires on top — it corrects any systematic XGBoost bias.
+    _xgb_prop_key = _XGB_PROP_MAP.get(prop_type)   # None for composites
+    _xgb_used     = False
+    if _xgb_prop_key and _XGB_MODELS.get(_xgb_prop_key):
+        try:
+            feats = _build_xgb_features(
+                player, po, rs, scoring_row, tracking_row, opp_def,
+                own_team_data, opp_team_data,
+                l5_avg, l5_min, l5_stat_values, rest_days, is_home,
+            )
+            xgb_pred = _xgb_predict(_xgb_prop_key, feats)
+            if xgb_pred is not None and xgb_pred > 0:
+                ev_vs_base = round((xgb_pred / base - 1) * 100, 1) if base else 0
+                corr = xgb_pred
+                _xgb_used = True
+                drivers.append(
+                    f"XGBoost ML Base — gradient-boosted prediction ({xgb_pred}) "
+                    f"replaces heuristic multiplier cascade. "
+                    f"Δ vs historical base: {ev_vs_base:+.1f}% "
+                    f"(l5={feats.get('l5_pts') or feats.get('l5_reb') or feats.get('l5_ast'):.1f}, "
+                    f"opp_def={feats.get('opp_def_roll10') or '?'})."
+                )
+                breakdown["xgb_base"] = xgb_pred
+                breakdown["xgb_vs_heuristic_pct"] = ev_vs_base
+        except Exception as _xe:
+            logging.warning("XGBoost inference error: %s", _xe)
+    breakdown["xgb_active"] = _xgb_used
+
+    # NOTE (v1 hybrid): When XGBoost is active, Adj 1-12 still run but their
+    # weight is additive on top of the ML base rather than the heuristic base.
+    # Adj 13 (injury cascade) MUST still run — it encodes real-time injury info
+    # that XGBoost's training data cannot know.
+    # Adj 14 (residual calibration) MUST still run — personalizes for this matchup.
+    # TODO v2: wrap Adj 1-12 in `if not _xgb_used:` to eliminate double-counting.
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 1 — AST CONVERSION WEIGHT
@@ -2030,6 +2256,8 @@ def post_project():
             "has_matchup":    bool(opp_delta),
             "has_scoring":    bool(scoring_row),
             "has_team_def":   bool(opp_def),
+            "xgb_active":     _xgb_used,
+            "xgb_models_loaded": list(_XGB_MODELS.keys()),
             "has_splits":     bool(splits_row),
             "has_clutch":     bool(clutch_row),
             "has_pace":       bool(own_team_data and opp_team_data),
@@ -2666,6 +2894,20 @@ def get_injuries():
 @app.route("/api/version")
 def get_version():
     return {"version": SERVER_VERSION, "ready": _warmup_done.is_set()}
+
+
+@app.route("/api/model-status")
+def model_status():
+    """Report which XGBoost models are loaded and ready for inference."""
+    meta_val = _XGB_META.get("validation_results", {})
+    return jsonify({
+        "xgb_available":    _XGB_AVAILABLE,
+        "models_loaded":    list(_XGB_MODELS.keys()),
+        "feature_cols":     _XGB_META.get("feature_cols", []),
+        "train_seasons":    _XGB_META.get("train_seasons", []),
+        "val_seasons":      _XGB_META.get("val_seasons", []),
+        "validation":       meta_val,
+    })
 
 
 @app.route("/api/debug-schedule")
