@@ -1,6 +1,7 @@
 import math
 import random
 import os
+import statistics
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from nba_api.stats.endpoints import (
@@ -31,7 +32,18 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.11-xgb-fstring-fix"  # fix bad fstring format spec crashing xgb driver
+# Live odds — optional; gracefully unavailable if ODDS_API_KEY not set
+try:
+    import requests as _requests_lib
+    from cachetools import TTLCache, cached as _ct_cached
+    _ODDS_CACHE   = TTLCache(maxsize=20, ttl=600)
+    _ODDS_AVAILABLE = True
+except ImportError:
+    _requests_lib = None
+    _ODDS_CACHE   = None
+    _ODDS_AVAILABLE = False
+
+SERVER_VERSION = "v6.10.0-live-odds"  # live odds slate fetch + /api/live-line route
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1406,6 +1418,118 @@ def _build_xgb_features(
         "opp_def_roll10": opp_def_roll10,
         "opp_pace_roll10": opp_pace_roll10,
     }
+
+
+# ── Live Odds (The Odds API) ──────────────────────────────────────────────────
+# Maps frontend prop_type keys → Odds API market strings
+_ODDS_MARKET_MAP = {
+    "points":         "player_points",
+    "rebounds":       "player_rebounds",
+    "assists":        "player_assists",
+    "three_pointers": "player_threes",
+    "steals":         "player_steals",
+    "blocks":         "player_blocks",
+    "pra":            "player_points_rebounds_assists",
+    "pa":             "player_points_assists",
+    "pr":             "player_points_rebounds",
+    "ra":             "player_rebounds_assists",
+}
+
+_PRIMARY_BOOKS = {"draftkings", "fanduel", "betmgm", "caesars"}
+
+
+def _fetch_odds_slate(market: str):
+    """
+    Pull the full NBA player-prop slate for one market string from The Odds API.
+    Wrapped in a TTLCache (10 min) so 100 player lookups cost ≤ (N_games + 1) API calls.
+    Returns list-of-game-dicts or None on any failure.
+    """
+    api_key = os.environ.get("ODDS_API_KEY", "")
+    if not api_key or not _ODDS_AVAILABLE:
+        return None
+    try:
+        # Step 1 — today's NBA events (event IDs required for player-prop endpoint)
+        ev_resp = _requests_lib.get(
+            "https://api.the-odds-api.com/v4/sports/basketball_nba/events",
+            params={"apiKey": api_key},
+            timeout=10,
+        )
+        if not ev_resp.ok:
+            logging.warning("Odds API /events %s: %s", ev_resp.status_code, ev_resp.text[:120])
+            return None
+        events = ev_resp.json()
+        if not events:
+            return []
+
+        # Step 2 — per-event player-prop odds (one call per game, cached together)
+        games = []
+        for ev in events[:12]:
+            try:
+                o = _requests_lib.get(
+                    f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{ev['id']}/odds",
+                    params={
+                        "apiKey":      api_key,
+                        "regions":     "us",
+                        "markets":     market,
+                        "oddsFormat":  "american",
+                    },
+                    timeout=10,
+                )
+                if o.ok:
+                    games.append(o.json())
+                else:
+                    logging.warning("Odds API game %s %s: %s", ev['id'], market, o.status_code)
+            except Exception as _ge:
+                logging.warning("Odds API game fetch: %s", _ge)
+        return games or None
+    except Exception as exc:
+        logging.warning("Odds API slate error: %s", exc)
+        return None
+
+
+# Apply TTL cache only when cachetools is available
+if _ODDS_AVAILABLE:
+    _fetch_odds_slate = _ct_cached(_ODDS_CACHE)(_fetch_odds_slate)
+
+
+@app.route("/api/live-line/<player_name>/<prop_key>", methods=["GET"])
+def get_live_line(player_name, prop_key):
+    """
+    Return the consensus sportsbook line for a player-prop by querying
+    the cached Odds API slate. Never hits the API on a per-player basis.
+    """
+    market = _ODDS_MARKET_MAP.get(prop_key.lower())
+    if not market:
+        return jsonify({"error": f"unsupported prop '{prop_key}'"}), 400
+
+    slate = _fetch_odds_slate(market)
+    if slate is None:
+        return jsonify({"error": "odds service unavailable — check ODDS_API_KEY"}), 503
+
+    name_norm = player_name.lower().strip()
+    lines = []
+    for game in slate:
+        for book in (game.get("bookmakers") or []):
+            if book.get("key") not in _PRIMARY_BOOKS:
+                continue
+            for mkt in (book.get("markets") or []):
+                for outcome in (mkt.get("outcomes") or []):
+                    desc = (outcome.get("description") or outcome.get("name") or "").lower().strip()
+                    if desc == name_norm and outcome.get("name", "").lower() in ("over", "under"):
+                        pt = outcome.get("point")
+                        if pt is not None:
+                            lines.append(float(pt))
+
+    if not lines:
+        return jsonify({"error": f"no line posted for '{player_name}'"}), 404
+
+    consensus = statistics.median(lines)
+    return jsonify({
+        "player":         player_name,
+        "prop":           prop_key,
+        "consensus_line": consensus,
+        "books_tracked":  len(lines),
+    })
 
 
 @app.route("/api/project", methods=["POST"])

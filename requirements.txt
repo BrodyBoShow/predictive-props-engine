@@ -3,3 +3,5 @@ flask-cors
 nba_api
 xgboost==3.2.0
 scikit-learn
+requests
+cachetools
