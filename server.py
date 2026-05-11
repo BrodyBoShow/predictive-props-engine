@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.3-xgb-diagnostics"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.9.4-xgb-sync-load"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -825,17 +825,18 @@ def _warmup():
             _sleep()
         except Exception as e:
             logging.error("Warm-up failed for %s: %s", cache_key, e)
-    # Load XGBoost models after all caches are warm
-    try:
-        _load_xgb_models()
-    except Exception as e:
-        logging.error("XGBoost model load failed: %s", e)
-
     _warmup_done.set()
     logging.info("Warm-up complete — all endpoints cached and ready.")
 
 
 threading.Thread(target=_warmup, daemon=True).start()
+
+# Load XGBoost models synchronously at startup — pure local file reads, < 1s.
+# Done at module level so global state is visible to all threads/workers.
+try:
+    _load_xgb_models()
+except Exception as _e:
+    logging.error("XGBoost model load failed at startup: %s", _e)
 
 
 # ── Helper: generic cached endpoint builder ───────────────────────────────────
