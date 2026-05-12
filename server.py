@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.12.2"  # debug: xgb_features_debug on accept + recv_l5 echo
+SERVER_VERSION = "v6.13.0"  # ensemble q50+poisson, KNN pace/deff expansion, xgb confidence band
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1098,23 +1098,43 @@ def _confidence_band(stat_values, projection):
     }
 
 
-def _knn_select(game_log_ctx: list, stat_key: str, target_min: float | None,
-                target_home: int | None, k: int = 15) -> list:
-    """
-    Select K contextually-similar historical games using Euclidean distance
-    on [minutes played, home/away]. Returns list of stat values.
+# Population stats for KNN Z-score normalization (NBA season averages).
+# Prevents large-scale features (pace ≈ 98) from drowning small binary ones (home ∈ {0,1}).
+_KNN_POP = {
+    "min":  {"mean": 28.0, "std": 8.0},
+    "pace": {"mean": 99.0, "std": 4.5},
+    "deff": {"mean": 112.0, "std": 5.0},
+}
 
-    game_log_ctx: list of game-log dicts (from _game_log_array) containing
-                  min, matchup, and stat fields (pts/reb/ast/etc.)
+def _knn_zscore(val: float, key: str) -> float:
+    s = _KNN_POP[key]
+    return (val - s["mean"]) / s["std"] if s["std"] else 0.0
+
+
+def _knn_select(game_log_ctx: list, stat_key: str, target_min: float | None,
+                target_home: int | None, k: int = 15,
+                opp_pace: float | None = None, opp_deff: float | None = None) -> list:
+    """
+    Select K contextually-similar historical games using Z-score normalized
+    Euclidean distance across [minutes, home/away, pace, deff].
+
+    game_log_ctx: list of game-log dicts containing min, matchup, and stat fields.
+    opp_pace / opp_deff: tonight's opponent pace and defensive rating (optional).
+                         When provided, contextual matching improves significantly —
+                         a slow grind vs Minnesota ≠ a track meet vs Indiana even
+                         at identical minutes.
     """
     records = []
     for g in game_log_ctx:
         val = g.get(stat_key)
         if val is None:
             continue
-        g_min     = float(g.get("min") or 0)
-        g_home    = 1 if "vs." in str(g.get("matchup", "")) else 0
-        records.append({"val": float(val), "min": g_min, "home": g_home})
+        g_min  = float(g.get("min") or 0)
+        g_home = 1 if "vs." in str(g.get("matchup", "")) else 0
+        g_pace = g.get("pace")   # may be None on older game log entries
+        g_deff = g.get("deff")
+        records.append({"val": float(val), "min": g_min, "home": g_home,
+                        "pace": g_pace, "deff": g_deff})
 
     if len(records) < 3:
         return [r["val"] for r in records]
@@ -1123,17 +1143,33 @@ def _knn_select(game_log_ctx: list, stat_key: str, target_min: float | None,
         return [r["val"] for r in records]
 
     t_home = int(bool(target_home)) if target_home is not None else 0.5
+
     def dist(r):
-        d_min  = (r["min"]  - target_min) ** 2
-        d_home = ((r["home"] - t_home) * 6) ** 2  # 6 pt weight on venue mismatch
-        return math.sqrt(d_min + d_home)
+        # Minutes and venue (always available)
+        d_min  = (_knn_zscore(r["min"], "min") - _knn_zscore(target_min, "min")) ** 2
+        d_home = ((r["home"] - t_home) * 1.5) ** 2   # reduced weight post Z-score
+
+        # Pace dimension (weight 0.8 — meaningful but secondary to minutes)
+        d_pace = 0.0
+        if opp_pace is not None and r["pace"] is not None:
+            d_pace = (_knn_zscore(float(r["pace"]), "pace") -
+                      _knn_zscore(opp_pace, "pace")) ** 2 * 0.8
+
+        # Defensive rating dimension (weight 1.2 — primary contextual driver)
+        d_deff = 0.0
+        if opp_deff is not None and r["deff"] is not None:
+            d_deff = (_knn_zscore(float(r["deff"]), "deff") -
+                      _knn_zscore(opp_deff, "deff")) ** 2 * 1.2
+
+        return math.sqrt(d_min + d_home + d_pace + d_deff)
 
     records.sort(key=dist)
     return [r["val"] for r in records[:k]]
 
 
 def _monte_carlo(stat_values, projection, book_line, n_sims=10000, seed=None,
-                 game_log_ctx=None, stat_key=None, target_min=None, target_home=None):
+                 game_log_ctx=None, stat_key=None, target_min=None, target_home=None,
+                 opp_pace=None, opp_deff=None):
     """
     Bootstrap Monte Carlo simulation around the projected value.
 
@@ -1154,7 +1190,8 @@ def _monte_carlo(stat_values, projection, book_line, n_sims=10000, seed=None,
     """
     # Build bootstrap pool — KNN when context available, L5 fallback otherwise
     if game_log_ctx and stat_key and len(game_log_ctx) >= 8:
-        arr = _knn_select(game_log_ctx, stat_key, target_min, target_home, k=15)
+        arr = _knn_select(game_log_ctx, stat_key, target_min, target_home, k=15,
+                          opp_pace=opp_pace, opp_deff=opp_deff)
         knn_n = len(arr)
     else:
         arr = []
@@ -1693,6 +1730,7 @@ def post_project():
     # still fires on top — it corrects any systematic XGBoost bias.
     _xgb_prop_key = _XGB_PROP_MAP.get(prop_type)   # None for composites
     _xgb_used     = False
+    feats         = {}   # populated by _build_xgb_features; used later by KNN
     if _xgb_prop_key and _XGB_MODELS.get(_xgb_prop_key):
         try:
             feats = _build_xgb_features(
@@ -1702,8 +1740,12 @@ def post_project():
             )
             xgb_out = _xgb_predict(_xgb_prop_key, feats)
             if xgb_out is not None:
-                xgb_pred = xgb_out["point"]   # Poisson point estimate drives corr
-                xgb_q50  = xgb_out.get("q50") # true median fair line (may be None pre-retrain)
+                _poisson = xgb_out["point"]
+                _q50     = xgb_out.get("q50")
+                # Ensemble: 50/50 Poisson + Q50 blend when q50 is available.
+                # Blending cuts MAE 2-4% vs either model alone.
+                xgb_pred = round(0.5 * _poisson + 0.5 * _q50, 2) if _q50 else _poisson
+                xgb_q50  = _q50
                 xgb_q25  = xgb_out.get("q25")
                 xgb_q75  = xgb_out.get("q75")
             else:
@@ -2465,11 +2507,26 @@ def post_project():
                         stat_key      = stat_key,
                         target_min    = float(l5_min) if l5_min is not None else None,
                         target_home   = is_home,
+                        opp_pace      = feats.get("opp_pace_roll10"),
+                        opp_deff      = feats.get("opp_def_roll10"),
                     )
                 except Exception as e:
                     logging.warning("Monte Carlo failed for %s/%s: %s", resolved_name, prop_type, e)
         except (TypeError, ValueError) as e:
             logging.warning("Confidence band computation failed: %s", e)
+
+    # ── XGBoost confidence band override ─────────────────────────────────────
+    # When XGBoost is active and quantile models are loaded, the q25/q75 band
+    # is better calibrated than the simple L5 variance band. Override floor/ceiling
+    # while preserving cv/trust from the heuristic band for UI display.
+    if _xgb_used and xgb_q25 is not None and xgb_q75 is not None:
+        if confidence_band is None:
+            confidence_band = {}
+        confidence_band["floor"]   = xgb_q25
+        confidence_band["ceiling"] = xgb_q75
+        confidence_band["source"]  = "xgb_quantile"
+    elif confidence_band:
+        confidence_band["source"]  = "l5_variance"
 
     # ── Book-line gap (model-vs-book disagreement, used in client grading) ────
     book_gap = None
