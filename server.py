@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.12.0"  # quantile models + KNN Monte Carlo + adj gate live
+SERVER_VERSION = "v6.12.1"  # fix opp_def_roll10 pulling rsDEFF from teams_cache
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1453,15 +1453,19 @@ def _build_xgb_features(
     # Opponent defensive proxy — pts allowed rolling avg
     opp_def_roll10  = None
     opp_pace_roll10 = None
-    if opp_def:
-        # team_defense cache stores oppPtsAllowed or dRtg-style metrics
+    if opp_team_data:
+        # rsDEFF = opponent defensive rating (pts allowed per game) from teams cache
+        deff = opp_team_data.get("rsDEFF") or opp_team_data.get("poDEFF")
+        if deff is not None:
+            opp_def_roll10 = float(deff)
+        pace = opp_team_data.get("rsPace") or opp_team_data.get("poPace")
+        if pace is not None:
+            opp_pace_roll10 = float(pace)
+    if opp_def_roll10 is None and opp_def:
+        # fallback: old team_defense cache key
         pts_allowed = opp_def.get("oppPtsAllowed") or opp_def.get("pts_allowed")
         if pts_allowed is not None:
             opp_def_roll10 = float(pts_allowed)
-    if opp_team_data:
-        pace = opp_team_data.get("pace") or opp_team_data.get("PACE")
-        if pace is not None:
-            opp_pace_roll10 = float(pace)
 
     return {
         "l5_pts":        l5_pts,
