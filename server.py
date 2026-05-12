@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.15.0"  # EWMA features, inactive_usg_pool, retrained models with 21 features
+SERVER_VERSION = "v6.16.0"  # Fix: route l5_avg+ewma to correct stat slot per prop_type; unify bulk l5_stat_values
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1512,21 +1512,39 @@ def _build_xgb_features(
     rest_days: int | None,
     is_home: bool | None,
     inactive_usg_pool: float = 0.0,
+    prop_type: str = "points",
 ) -> dict:
     """
     Assemble the feature vector matching the training pipeline columns.
     All values are best-effort from warm caches — None means imputed at inference.
+    l5_avg is the client-sent L5 average for the CURRENT prop — route it to the
+    correct feature slot (l5_pts / l5_reb / l5_ast) based on prop_type.
     """
-    # L5 averages — prefer client-sent L5 (already computed from /api/recent)
-    l5_pts = float(l5_avg)  if l5_avg is not None else float(po.get("ppg") or po.get("pts") or 0) or None
-    l5_reb = float(po.get("rpg") or po.get("reb") or 0) or None
-    l5_ast = float(po.get("apg") or po.get("ast") or 0) or None
+    _l5_po_pts = float(po.get("ppg") or po.get("pts") or 0) or None
+    _l5_po_reb = float(po.get("rpg") or po.get("reb") or 0) or None
+    _l5_po_ast = float(po.get("apg") or po.get("ast") or 0) or None
+    _l5_client  = float(l5_avg) if l5_avg is not None else None
+
+    # Route client-sent L5 avg to the matching stat slot; fall back to PO season avg
+    if prop_type == "rebounds":
+        l5_pts = _l5_po_pts
+        l5_reb = _l5_client if _l5_client is not None else _l5_po_reb
+        l5_ast = _l5_po_ast
+    elif prop_type == "assists":
+        l5_pts = _l5_po_pts
+        l5_reb = _l5_po_reb
+        l5_ast = _l5_client if _l5_client is not None else _l5_po_ast
+    else:  # points (and composites — fall back to pts slot)
+        l5_pts = _l5_client if _l5_client is not None else _l5_po_pts
+        l5_reb = _l5_po_reb
+        l5_ast = _l5_po_ast
+
     l5_min_v = float(l5_min) if l5_min is not None else float(po.get("min") or 0) or None
 
     # EWMA features — at live inference we approximate from L5 values.
-    # When game_log_context is available (≥3 entries), compute a proper
-    # exponentially weighted mean with halflife=3 games from the log.
-    # Falls back to l5_* when log is unavailable (model will use median imputation).
+    # Route the per-game stat array (l5_stat_values) to the CORRECT ewma slot
+    # so the model sees the same feature semantics it was trained on.
+    # Falls back to l5_* when log is unavailable.
     def _ewma_from_log(log_vals, halflife=3.0):
         if not log_vals or len(log_vals) < 3:
             return None
@@ -1542,11 +1560,22 @@ def _build_xgb_features(
         except Exception:
             return None
 
-    # Extract per-stat values from game_log_context if provided
-    _log = l5_stat_values or []   # l5_stat_values is the per-game stat array passed by client
-    ewma_pts = _ewma_from_log(_log) or l5_pts
-    ewma_reb = l5_reb    # reb/ast not sent as game-by-game; use l5 approximation
-    ewma_ast = l5_ast
+    _log = l5_stat_values or []
+    _ewma_from_client = _ewma_from_log(_log)  # EWMA of the current prop's per-game values
+
+    if prop_type == "rebounds":
+        ewma_pts = l5_pts
+        ewma_reb = _ewma_from_client or l5_reb
+        ewma_ast = l5_ast
+    elif prop_type == "assists":
+        ewma_pts = l5_pts
+        ewma_reb = l5_reb
+        ewma_ast = _ewma_from_client or l5_ast
+    else:  # points
+        ewma_pts = _ewma_from_client or l5_pts
+        ewma_reb = l5_reb
+        ewma_ast = l5_ast
+
     ewma_min_v = None
     if l5_stat_values and len(l5_stat_values) >= 3:
         # Approximate EWMA for minutes from l5_min (best available at inference)
@@ -1561,7 +1590,7 @@ def _build_xgb_features(
 
     # l5_usg removed from feature set — FGA not reliably available at inference.
 
-    # L10 volatility — std of the L5 values passed by client
+    # L10 volatility — std of the L5 values passed by client (prop-specific)
     l10_pts_std = None
     l10_min_std = None
     if l5_stat_values and len(l5_stat_values) >= 3:
@@ -1997,6 +2026,7 @@ def post_project():
                 own_team_data, opp_team_data,
                 l5_avg, l5_min, l5_stat_values, rest_days, is_home,
                 inactive_usg_pool=_inactive_usg_pool,
+                prop_type=prop_type,
             )
             xgb_out = _xgb_predict(_xgb_prop_key, feats)
             if xgb_out is not None:
