@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.11.1-quantile-ready"  # quantile model loader + adj gate + q25/q50/q75 in response
+SERVER_VERSION = "v6.12.0"  # quantile models + KNN Monte Carlo + adj gate live
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1098,43 +1098,78 @@ def _confidence_band(stat_values, projection):
     }
 
 
-def _monte_carlo(stat_values, projection, book_line, n_sims=10000, seed=None):
+def _knn_select(game_log_ctx: list, stat_key: str, target_min: float | None,
+                target_home: int | None, k: int = 15) -> list:
+    """
+    Select K contextually-similar historical games using Euclidean distance
+    on [minutes played, home/away]. Returns list of stat values.
+
+    game_log_ctx: list of game-log dicts (from _game_log_array) containing
+                  min, matchup, and stat fields (pts/reb/ast/etc.)
+    """
+    records = []
+    for g in game_log_ctx:
+        val = g.get(stat_key)
+        if val is None:
+            continue
+        g_min     = float(g.get("min") or 0)
+        g_home    = 1 if "vs." in str(g.get("matchup", "")) else 0
+        records.append({"val": float(val), "min": g_min, "home": g_home})
+
+    if len(records) < 3:
+        return [r["val"] for r in records]
+
+    if target_min is None or len(records) < k:
+        return [r["val"] for r in records]
+
+    t_home = int(bool(target_home)) if target_home is not None else 0.5
+    def dist(r):
+        d_min  = (r["min"]  - target_min) ** 2
+        d_home = ((r["home"] - t_home) * 6) ** 2  # 6 pt weight on venue mismatch
+        return math.sqrt(d_min + d_home)
+
+    records.sort(key=dist)
+    return [r["val"] for r in records[:k]]
+
+
+def _monte_carlo(stat_values, projection, book_line, n_sims=10000, seed=None,
+                 game_log_ctx=None, stat_key=None, target_min=None, target_home=None):
     """
     Bootstrap Monte Carlo simulation around the projected value.
 
-    Method: non-parametric bootstrap from the L5 (or longer) game log,
-    *recentered* on the model's projection. This preserves the empirical
-    shape of the player's distribution (skew, kurtosis, blowout outliers)
-    rather than assuming normality — critical for stats like 3PM and TOV
-    which are highly right-skewed.
+    When game_log_ctx is provided (full game log with min/matchup context),
+    uses KNN feature-space matching to select the K=15 most contextually
+    similar historical games as the bootstrap pool — producing a smoother
+    eCDF than the sparse L5 sample alone.
+
+    Falls back to plain bootstrap on stat_values when context is unavailable.
 
     Pipeline:
-      1. shift = projection - mean(stat_values)
-         → recenters the distribution so its mean equals the model projection
-      2. For n_sims iterations: pick random sample from stat_values, add shift
-      3. Sort the simulated array; compute percentiles
-      4. prob_over  = #(sims > book_line) / n_sims
-         prob_under = #(sims < book_line) / n_sims
-         prob_push  = 1 - prob_over - prob_under  (only when line is integer)
-      5. implied_fair_line = median (50th percentile) — the line at which
-         a coin-flip bet is mathematically fair. If finalProj=22 but P50=21,
-         the model's "true" expectation is 21 (skewed distribution).
+      1. pool = KNN-selected games (or stat_values fallback)
+      2. shift = projection - mean(pool)   → recenter on ML projection
+      3. n_sims bootstrap draws; floor at 0
+      4. prob_over/under, P10/P25/P50/P75/P90 from sorted sims
 
     Returns dict or None when sample is too small (< 3 games).
-
-    Args:
-        stat_values: list of historical per-game stat values (L5 game log)
-        projection:  the model's correlated projection (mean of recentered dist)
-        book_line:   the sportsbook line (used for prob_over/under)
-        n_sims:      number of bootstrap samples (default 10K)
-        seed:        optional RNG seed for reproducibility (None = nondeterministic)
     """
-    if not stat_values or len(stat_values) < 3:
-        return None
-    try:
-        arr = [float(v) for v in stat_values if v is not None]
-    except (TypeError, ValueError):
-        return None
+    # Build bootstrap pool — KNN when context available, L5 fallback otherwise
+    if game_log_ctx and stat_key and len(game_log_ctx) >= 8:
+        arr = _knn_select(game_log_ctx, stat_key, target_min, target_home, k=15)
+        knn_n = len(arr)
+    else:
+        arr = []
+        knn_n = 0
+
+    if len(arr) < 3:
+        # Fall back to the plain stat_values array
+        if not stat_values or len(stat_values) < 3:
+            return None
+        try:
+            arr = [float(v) for v in stat_values if v is not None]
+        except (TypeError, ValueError):
+            return None
+        knn_n = 0
+
     if len(arr) < 3:
         return None
 
@@ -1190,7 +1225,8 @@ def _monte_carlo(stat_values, projection, book_line, n_sims=10000, seed=None):
         "fair_odds_over":     fair_odds_over,
         "fair_odds_under":    fair_odds_under,
         "edge_from_50":       edge_from_50,
-        "method":             "bootstrap_recentered",
+        "method":             "knn_bootstrap" if knn_n >= 8 else "bootstrap_recentered",
+        "knn_n":              knn_n,
     }
 
 
@@ -1588,7 +1624,8 @@ def post_project():
     # Optional context from client (enriches server projection — never fabricated)
     l5_avg       = body.get("l5_avg")        # client-computed L5 PO avg for this prop
     l5_min       = body.get("l5_min")        # client-computed L5 PO minutes/game (from /api/recent)
-    l5_stat_values = body.get("l5_stat_values") or []  # array of L5 stat values for THIS prop (for variance band)
+    l5_stat_values   = body.get("l5_stat_values") or []   # L5 stat values for this prop (variance band)
+    game_log_context = body.get("game_log_context") or []  # full PO game log objects for KNN bootstrap
     rest_days    = body.get("rest_days")     # player's team rest days (int)
     team_abbr    = (body.get("team_abbr") or "").strip().upper()  # player's own team
     is_home      = body.get("is_home")       # bool: player playing at home?
@@ -2411,7 +2448,19 @@ def post_project():
                 # game day (same inputs → same probabilities all night).
                 try:
                     seed = hash((resolved_name, prop_type, datetime.now().strftime("%Y%m%d"))) & 0xFFFFFFFF
-                    monte_carlo = _monte_carlo(vals, corr, book_line, n_sims=10000, seed=seed)
+                    _PROP_STAT_KEY = {
+                        "points": "pts", "rebounds": "reb", "assists": "ast",
+                        "steals": "stl", "blocks": "blk", "three_pointers": "fg3m",
+                        "pra": None, "pa": None, "pr": None, "ra": None,
+                    }
+                    stat_key = _PROP_STAT_KEY.get(prop_type)
+                    monte_carlo = _monte_carlo(
+                        vals, corr, book_line, n_sims=10000, seed=seed,
+                        game_log_ctx  = game_log_context if stat_key else None,
+                        stat_key      = stat_key,
+                        target_min    = float(l5_min) if l5_min is not None else None,
+                        target_home   = is_home,
+                    )
                 except Exception as e:
                     logging.warning("Monte Carlo failed for %s/%s: %s", resolved_name, prop_type, e)
         except (TypeError, ValueError) as e:
@@ -3380,9 +3429,10 @@ def get_recent(player_id):
         recent = logs.head(5)
         payload = {
             "success": True,
-            "recent":  _game_log_avg(recent),
-            "gp":      len(recent),
-            "gameLog": _game_log_array(recent),  # per-game array for variance band
+            "recent":  _game_log_avg(recent),    # L5 averages (always head 5)
+            "gp":      len(logs),
+            "gameLog": _game_log_array(recent),  # L5 per-game array (UI / L5 avg)
+            "gameLogFull": _game_log_array(logs), # Full PO log for KNN Monte Carlo
         }
         _cache_set(cache_key, payload)
         return payload

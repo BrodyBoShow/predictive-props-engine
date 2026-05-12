@@ -41,21 +41,39 @@
       "mae": 4.680390357971191,
       "within_3": 0.4082027395097304,
       "best_iteration": 435,
-      "model_file": "xgb_pts_model.json"
+      "model_file": "xgb_pts_model.json",
+      "q25_mae": 5.534668445587158,
+      "q25_file": "xgb_pts_q25.json",
+      "q50_mae": 4.639660358428955,
+      "q50_file": "xgb_pts_q50.json",
+      "q75_mae": 5.640002727508545,
+      "q75_file": "xgb_pts_q75.json"
     },
     "reb": {
       "rmse": 2.5411599284664192,
       "mae": 1.9228501319885254,
       "within_3": 0.804602692140686,
       "best_iteration": 437,
-      "model_file": "xgb_reb_model.json"
+      "model_file": "xgb_reb_model.json",
+      "q25_mae": 2.292757987976074,
+      "q25_file": "xgb_reb_q25.json",
+      "q50_mae": 1.909657597541809,
+      "q50_file": "xgb_reb_q50.json",
+      "q75_mae": 2.3095076084136963,
+      "q75_file": "xgb_reb_q75.json"
     },
     "ast": {
       "rmse": 1.8377712101506989,
       "mae": 1.3551318645477295,
       "within_3": 0.9057750759878419,
       "best_iteration": 358,
-      "model_file": "xgb_ast_model.json"
+      "model_file": "xgb_ast_model.json",
+      "q25_mae": 1.5668587684631348,
+      "q25_file": "xgb_ast_q25.json",
+      "q50_mae": 1.3296277523040771,
+      "q50_file": "xgb_ast_q50.json",
+      "q75_mae": 1.6385523080825806,
+      "q75_file": "xgb_ast_q75.json"
     }
   },
   "train_seasons": [
@@ -64,5 +82,10 @@
   ],
   "val_seasons": [
     "2024-25"
+  ],
+  "quantiles": [
+    0.25,
+    0.5,
+    0.75
   ]
 }
