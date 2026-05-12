@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.12.1"  # fix opp_def_roll10 pulling rsDEFF from teams_cache
+SERVER_VERSION = "v6.12.2"  # debug: xgb_features_debug on accept + recv_l5 echo
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1738,6 +1738,7 @@ def post_project():
                     breakdown["xgb_q25"]              = xgb_q25
                     breakdown["xgb_q50"]              = xgb_q50   # true fair line
                     breakdown["xgb_q75"]              = xgb_q75
+                    breakdown["xgb_features_debug"]   = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in feats.items()}
         except Exception as _xe:
             logging.warning("XGBoost inference error: %s", _xe)
     breakdown["xgb_active"] = _xgb_used
@@ -2505,6 +2506,8 @@ def post_project():
             "has_l5":         l5_avg is not None,
             "has_l5_min":     l5_min is not None,
             "has_l5_games":   bool(l5_stat_values),
+            "recv_l5_avg":    round(float(l5_avg), 3) if l5_avg is not None else None,
+            "recv_l5_min":    round(float(l5_min), 3) if l5_min is not None else None,
             "use_rate_base":  use_rate_base,
             "has_rest":       rest_days is not None,
             "is_home":        is_home,
