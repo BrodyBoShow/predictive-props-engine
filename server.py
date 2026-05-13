@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.23.1"  # fix: narrative voice — direct conviction openers, opinionated prose, no "the model" language
+SERVER_VERSION = "v6.24.0"  # feat: 3PA / FGA / 2PA props — new stat fields, shot-volume adj, all calibrations wired
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -288,17 +288,19 @@ def _stat_row(r):
     if not r:
         return None
     return {
-        "ppg":  _f(r.get("PTS", 0)),
-        "rpg":  _f(r.get("REB", 0)),
-        "apg":  _f(r.get("AST", 0)),
-        "spg":  _f(r.get("STL", 0)),
-        "bpg":  _f(r.get("BLK", 0)),
-        "topg": _f(r.get("TOV", 0)),
-        "fg":   _pct(r.get("FG_PCT")),
-        "fg3":  _pct(r.get("FG3_PCT")),
-        "ft":   _pct(r.get("FT_PCT")),
-        "min":  _f(r.get("MIN", 0)),
-        "gp":   _i(r.get("GP", 0)),
+        "ppg":    _f(r.get("PTS", 0)),
+        "rpg":    _f(r.get("REB", 0)),
+        "apg":    _f(r.get("AST", 0)),
+        "spg":    _f(r.get("STL", 0)),
+        "bpg":    _f(r.get("BLK", 0)),
+        "topg":   _f(r.get("TOV", 0)),
+        "fg":     _pct(r.get("FG_PCT")),
+        "fg3":    _pct(r.get("FG3_PCT")),
+        "ft":     _pct(r.get("FT_PCT")),
+        "min":    _f(r.get("MIN", 0)),
+        "gp":     _i(r.get("GP", 0)),
+        "fgapg":  _f(r.get("FGA", 0)),   # field goal attempts per game
+        "fg3apg": _f(r.get("FG3A", 0)),  # 3-point attempts per game
     }
 
 
@@ -1047,23 +1049,28 @@ _TS_GOOD_THRESH        = 55.0   # TS% above this = efficient
 _TS_BAD_THRESH         = 50.0   # TS% below this = inefficient
 _CLUTCH_LIFT_THRESH    = 0.20   # ±20% clutch divergence → meaningful signal
 _COUNTING_PROPS = ("points","assists","rebounds","steals","blocks",
-                   "pra","pa","pr","ra","three_pointers")
+                   "pra","pa","pr","ra","three_pointers",
+                   "three_point_attempts","field_goal_attempts","two_point_attempts")
 _SCORING_PROPS  = ("points","pra","pa","pr","three_pointers")
+_ATTEMPT_PROPS  = ("three_point_attempts","field_goal_attempts","two_point_attempts")
 
 
 # ── Analyst Narrative Generator ──────────────────────────────────────────────
 
 _PROP_NOUN = {
-    "points":        ("points",              "scoring output",       "PPG"),
-    "rebounds":      ("rebounds",            "rebounding total",     "boards"),
-    "assists":       ("assists",             "assist total",         "playmaking output"),
-    "three_pointers":("three-pointers",      "perimeter production", "threes"),
-    "pra":           ("PRA",                 "combined PRA total",   "points+rebounds+assists"),
-    "pa":            ("P+A",                 "points-plus-assists",  "P+A total"),
-    "pr":            ("P+R",                 "points-plus-rebounds", "P+R total"),
-    "ra":            ("R+A",                 "rebounds-plus-assists","R+A total"),
-    "steals":        ("steals",              "steal total",          "steals"),
-    "blocks":        ("blocks",              "block total",          "blocks"),
+    "points":               ("points",              "scoring output",        "PPG"),
+    "rebounds":             ("rebounds",            "rebounding total",      "boards"),
+    "assists":              ("assists",             "assist total",          "playmaking output"),
+    "three_pointers":       ("three-pointers",      "perimeter production",  "threes"),
+    "pra":                  ("PRA",                 "combined PRA total",    "points+rebounds+assists"),
+    "pa":                   ("P+A",                 "points-plus-assists",   "P+A total"),
+    "pr":                   ("P+R",                 "points-plus-rebounds",  "P+R total"),
+    "ra":                   ("R+A",                 "rebounds-plus-assists", "R+A total"),
+    "steals":               ("steals",              "steal total",           "steals"),
+    "blocks":               ("blocks",              "block total",           "blocks"),
+    "three_point_attempts": ("3-point attempts",    "3PA total",             "3PA"),
+    "field_goal_attempts":  ("field goal attempts", "FGA total",             "FGA"),
+    "two_point_attempts":   ("2-point attempts",    "2PA total",             "2PA"),
 }
 
 def _generate_analyst_narrative(
@@ -1786,6 +1793,15 @@ def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
         pct = float((scoring_row or {}).get("pctPts3pt") or 0)
         po_v = _s(po,"ppg") * (pct / 100) / 3 if pct > 0 else 0
         rs_v = _s(rs,"ppg") * (pct / 100) / 3 if pct > 0 else 0
+    elif prop_type == "three_point_attempts":
+        po_v = _s(po, "fg3apg")
+        rs_v = _s(rs, "fg3apg")
+    elif prop_type == "field_goal_attempts":
+        po_v = _s(po, "fgapg")
+        rs_v = _s(rs, "fgapg")
+    elif prop_type == "two_point_attempts":
+        po_v = max(0.0, _s(po, "fgapg") - _s(po, "fg3apg"))
+        rs_v = max(0.0, _s(rs, "fgapg") - _s(rs, "fg3apg"))
     else:
         key_map = {"points":"ppg","assists":"apg","rebounds":"rpg",
                    "steals":"spg","blocks":"bpg"}
@@ -2196,16 +2212,19 @@ def _build_xgb_features(
 # ── Live Odds (The Odds API) ──────────────────────────────────────────────────
 # Maps frontend prop_type keys → Odds API market strings
 _ODDS_MARKET_MAP = {
-    "points":         "player_points",
-    "rebounds":       "player_rebounds",
-    "assists":        "player_assists",
-    "three_pointers": "player_threes",
-    "steals":         "player_steals",
-    "blocks":         "player_blocks",
-    "pra":            "player_points_rebounds_assists",
-    "pa":             "player_points_assists",
-    "pr":             "player_points_rebounds",
-    "ra":             "player_rebounds_assists",
+    "points":               "player_points",
+    "rebounds":             "player_rebounds",
+    "assists":              "player_assists",
+    "three_pointers":       "player_threes",
+    "steals":               "player_steals",
+    "blocks":               "player_blocks",
+    "pra":                  "player_points_rebounds_assists",
+    "pa":                   "player_points_assists",
+    "pr":                   "player_points_rebounds",
+    "ra":                   "player_rebounds_assists",
+    "field_goal_attempts":  "player_field_goals_attempted",
+    "three_point_attempts": "player_threes_attempted",
+    "two_point_attempts":   "player_two_point_attempts",
 }
 
 _PRIMARY_BOOKS = {"draftkings", "fanduel", "betmgm", "caesars"}
@@ -2683,8 +2702,13 @@ def post_project():
         # ─────────────────────────────────────────────────────────────────────────
         _DEF_COMPOSITE_PROPS = {
             **{p: 1.0 for p in _SCORING_PROPS},
-            "rebounds": 0.40,
-            "assists":  0.40,
+            "rebounds":             0.40,
+            "assists":              0.40,
+            # Attempt props: general dEFF affects total opportunity; scale down
+            # since specific shot-diet adjustments (Adj 3b) handle the primary signal
+            "field_goal_attempts":  0.35,
+            "three_point_attempts": 0.25,
+            "two_point_attempts":   0.30,
         }
         def_composite_pct = 0.0
         if prop_type in _DEF_COMPOSITE_PROPS and opp_team_data:
@@ -2756,6 +2780,46 @@ def post_project():
                 )
         breakdown["shotProfileAdj"] = shot_delta
         corr = round(corr + shot_delta, 2)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 3b — SHOT VOLUME OPPONENT ALIGNMENT (attempt props only)
+        # For 3PA/FGA/2PA props, opponent shot-diet concession rates are the primary
+        # matchup signal (more direct than dEFF for volume props).
+        #   • 3PA:  fg3VsAvg — measures opponent's extra 3PA conceded vs league avg
+        #           Normalize by ~0.38 (avg 3PA rate) to convert pp→ fractional delta
+        #   • 2PA:  rimVsAvg — soft paint defence → more drive/2PA volume
+        #   • FGA:  blend of both + overall dEFF already handled in Adj 2
+        # Cap: ±15% for 3PA/2PA, ±10% for FGA (dEFF handles most of the FGA signal)
+        # ─────────────────────────────────────────────────────────────────────────
+        shot_vol_pct = 0.0
+        if prop_type in _ATTEMPT_PROPS and opp_def:
+            fg3_va = float(opp_def.get("fg3VsAvg") or 0)
+            rim_va = float(opp_def.get("rimVsAvg") or 0)
+
+            if prop_type == "three_point_attempts":
+                # fg3VsAvg is a rate delta (pp). Normalize to fractional: delta/avg_3pa_rate
+                shot_vol_pct = _soft_cap(fg3_va / 0.38, 0.15)
+            elif prop_type == "two_point_attempts":
+                # rimVsAvg measures opponent rim FG% allowed delta; correlated with 2PA volume
+                shot_vol_pct = _soft_cap(rim_va / 0.45, 0.15)
+            elif prop_type == "field_goal_attempts":
+                # FGA is split between 3PA and 2PA — blend both signals with equal weight
+                shot_vol_pct = _soft_cap(fg3_va / 0.38 * 0.45 + rim_va / 0.45 * 0.35, 0.10)
+
+            if abs(shot_vol_pct) >= 0.005:
+                direction = "+" if shot_vol_pct > 0 else "-"
+                signal_desc = {
+                    "three_point_attempts": f"fg3VsAvg {fg3_va:+.3f}",
+                    "two_point_attempts":   f"rimVsAvg {rim_va:+.3f}",
+                    "field_goal_attempts":  f"fg3VsAvg {fg3_va:+.3f} + rimVsAvg {rim_va:+.3f}",
+                }.get(prop_type, "")
+                shot_vol_abs = round(corr * shot_vol_pct, 2)
+                drivers.append(
+                    f"Shot Volume Matchup — {opp_abbr} opponent scheme ({signal_desc}). "
+                    f"Impact: {shot_vol_pct*100:+.1f}% ({shot_vol_abs:+.2f} attempts)."
+                )
+        breakdown["shotVolAdj"] = round(shot_vol_pct * 100, 2)
+        corr = round(corr * (1 + shot_vol_pct), 2)
 
         # ─────────────────────────────────────────────────────────────────────────
         # ADJUSTMENT 4 — HUSTLE / REBOUND REALIZATION RATE
@@ -2836,10 +2900,17 @@ def post_project():
                 key_map_2 = {"points":"ppg","assists":"apg","rebounds":"rpg",
                              "steals":"spg","blocks":"bpg",
                              "pra":("ppg","rpg","apg"),"pa":("ppg","apg"),"pr":("ppg","rpg"),
-                             "ra":("rpg","apg")}
+                             "ra":("rpg","apg"),
+                             "three_point_attempts":"fg3apg",
+                             "field_goal_attempts":"fgapg",
+                             "two_point_attempts":("fgapg","fg3apg"),  # special: fga - fg3a
+                             }
                 k2 = key_map_2.get(prop_type)
                 if k2 and l5 > 0:
-                    if isinstance(k2, tuple):
+                    if prop_type == "two_point_attempts":
+                        po_v2 = max(0.0, _s2(po,"fgapg") - _s2(po,"fg3apg"))
+                        rs_v2 = max(0.0, _s2(rs,"fgapg") - _s2(rs,"fg3apg"))
+                    elif isinstance(k2, tuple):
                         po_v2 = sum(_s2(po, x) for x in k2)
                         rs_v2 = sum(_s2(rs, x) for x in k2)
                     else:
@@ -2896,23 +2967,34 @@ def post_project():
         # Cap ±6%. Requires client to pass is_home and prop must be home/road relevant.
         # ─────────────────────────────────────────────────────────────────────────
         splits_pct = 0.0
-        if splits_row and is_home is not None and prop_type in ("points","assists","rebounds","pra","pa","pr","ra"):
+        if splits_row and is_home is not None and prop_type in (
+            "points","assists","rebounds","pra","pa","pr","ra",
+            "three_point_attempts","field_goal_attempts","two_point_attempts",
+        ):
             home = splits_row.get("home") or {}
             road = splits_row.get("road") or {}
             key_map = {
                 "points":"ppg", "assists":"apg", "rebounds":"rpg",
                 "pra":["ppg","rpg","apg"], "pa":["ppg","apg"], "pr":["ppg","rpg"], "ra":["rpg","apg"],
+                "three_point_attempts":"fg3apg",
+                "field_goal_attempts":"fgapg",
             }
             k = key_map.get(prop_type)
             h_gp = int(home.get("gp") or 0)
             r_gp = int(road.get("gp") or 0)
+            # two_point_attempts is derived (FGA - 3PA) — not in key_map
+            if prop_type == "two_point_attempts" and h_gp >= 1 and r_gp >= 1:
+                h = max(0.0, float(home.get("fgapg") or 0) - float(home.get("fg3apg") or 0))
+                r = max(0.0, float(road.get("fgapg") or 0) - float(road.get("fg3apg") or 0))
+                k = "__derived__"   # sentinel so the block below fires
             if h_gp >= 1 and r_gp >= 1 and k:
-                if isinstance(k, list):
-                    h = sum(float(home.get(x) or 0) for x in k)
-                    r = sum(float(road.get(x) or 0) for x in k)
-                else:
-                    h = float(home.get(k) or 0)
-                    r = float(road.get(k) or 0)
+                if k != "__derived__":
+                    if isinstance(k, list):
+                        h = sum(float(home.get(x) or 0) for x in k)
+                        r = sum(float(road.get(x) or 0) for x in k)
+                    else:
+                        h = float(home.get(k) or 0)
+                        r = float(road.get(k) or 0)
                 if h > 0 and r > 0:
                     venue_avg = h if is_home else r
                     other_avg = r if is_home else h
@@ -2984,7 +3066,7 @@ def post_project():
         usg_pct_adj = 0.0
         po_usg = float(po.get("usg") or 0)
         po_ts  = float(po.get("ts")  or 0)
-        if prop_type in _SCORING_PROPS and po_usg > 0:
+        if prop_type in (*_SCORING_PROPS, *_ATTEMPT_PROPS) and po_usg > 0:
             if po_usg >= _USG_ELITE_THRESH and po_ts >= _TS_GOOD_THRESH:
                 usg_pct_adj = 0.02
                 label = "ELITE-VOLUME EFFICIENT"
@@ -3073,7 +3155,7 @@ def post_project():
 
     else:
         # XGBoost active — zero out heuristic adjustment breakdown fields
-        for _k in ("astConvAdj","defCompositeAdj","shotProfileAdj","hustleAdj",
+        for _k in ("astConvAdj","defCompositeAdj","shotProfileAdj","shotVolAdj","hustleAdj",
                    "paceAdj","recentFormAdj","restAdj","splitsAdj","clutchAdj",
                    "usageAdj","playoffFormAdj","debutAdj","defMatchAdj"):
             breakdown[_k] = 0.0
