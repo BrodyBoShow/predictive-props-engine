@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.20.0"  # feat: tracking features native to XGBoost — efficiency_delta, fg3/rim_vs_avg, l5_potential_ast; retrained all models
+SERVER_VERSION = "v6.20.1"  # fix: tracking bullet restored as informational when XGBoost active; heuristic adj still fires on non-XGB path
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2646,12 +2646,12 @@ def post_project():
                    "usageAdj","playoffFormAdj","debutAdj","defMatchAdj"):
             breakdown[_k] = 0.0
 
-    # ADJUSTMENT 4b — SHOT QUALITY (points props, heuristic path only)
-    # When XGBoost is active: efficiency_delta is a native model feature — applying
-    # this adjustment on top would double-count. Model handles it natively.
-    # When heuristic base only: full ±3% cap for standalone calibration.
+    # ADJUSTMENT 4b — SHOT QUALITY
+    # XGBoost path: efficiency_delta is a NATIVE model feature — no separate
+    # adjustment applied (would double-count). Show informational bullet only.
+    # Heuristic path: full ±3% calibration adjustment fires as before.
     shot_qual_adj = 0.0
-    if not _xgb_used and prop_type in _SCORING_PROPS and tracking_row:
+    if prop_type in _SCORING_PROPS and tracking_row:
         drive_fga  = float(tracking_row.get("driveFga",         0) or 0)
         pullup_fga = float(tracking_row.get("pullUpFga",         0) or 0)
         cs_fga     = float(tracking_row.get("catchShootFga",     0) or 0)
@@ -2665,20 +2665,30 @@ def post_project():
                 (pullup_eff - _LEAGUE_AVG_PULLUP_EFG_PCT)  * (pullup_fga / total_fga) +
                 (cs_eff     - _LEAGUE_AVG_CS_EFG_PCT)      * (cs_fga     / total_fga)
             )
-            cap = _SHOT_QUAL_CAP_XGB if _xgb_used else _SHOT_QUAL_CAP
-            shot_qual_pct = _soft_cap(eff_delta, cap)
-            shot_qual_adj = round(corr * shot_qual_pct, 2)
-            if abs(shot_qual_pct) >= 0.005:
-                direction = "ABOVE" if eff_delta > 0 else "BELOW"
-                xgb_note = " (capped ±1.5% — XGBoost active)" if _xgb_used else ""
+            direction = "ABOVE" if eff_delta > 0 else "BELOW"
+            if _xgb_used:
+                # Informational only — XGBoost already encoded efficiency_delta natively.
+                # Show the tracking breakdown so it's visible in analysis, no proj change.
                 drivers.append(
-                    f"Shot Quality Tracking — {resolved_name.title()} shoots "
-                    f"{abs(eff_delta)*100:.1f}% {direction} league avg "
-                    f"across drives ({drive_eff:.1%} FG%), "
-                    f"pull-ups ({pullup_eff:.1%} EFG%), "
-                    f"catch-&-shoot ({cs_eff:.1%} EFG%). "
-                    f"Impact: {shot_qual_adj:+.2f} pts{xgb_note}."
+                    f"Shot Quality Tracking (XGBoost native) — {resolved_name.title()} shoots "
+                    f"{abs(eff_delta)*100:.1f}% {direction} league avg across "
+                    f"drives ({drive_fga:.1f}/g @ {drive_eff:.1%} FG), "
+                    f"pull-ups ({pullup_fga:.1f}/g @ {pullup_eff:.1%} eFG), "
+                    f"catch-&-shoot ({cs_fga:.1f}/g @ {cs_eff:.1%} eFG). "
+                    f"Encoded in XGBoost prediction above — no separate adjustment."
                 )
+            else:
+                shot_qual_pct = _soft_cap(eff_delta, _SHOT_QUAL_CAP)
+                shot_qual_adj = round(corr * shot_qual_pct, 2)
+                if abs(shot_qual_pct) >= 0.005:
+                    drivers.append(
+                        f"Shot Quality Tracking — {resolved_name.title()} shoots "
+                        f"{abs(eff_delta)*100:.1f}% {direction} league avg across "
+                        f"drives ({drive_fga:.1f}/g @ {drive_eff:.1%} FG), "
+                        f"pull-ups ({pullup_fga:.1f}/g @ {pullup_eff:.1%} eFG), "
+                        f"catch-&-shoot ({cs_fga:.1f}/g @ {cs_eff:.1%} eFG). "
+                        f"Impact: {shot_qual_adj:+.2f} pts."
+                    )
     breakdown["shotQualAdj"] = shot_qual_adj
     corr = round(corr + shot_qual_adj, 2)
 
