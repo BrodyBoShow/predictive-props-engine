@@ -1554,6 +1554,8 @@ def _build_xgb_features(
     rest_days: int | None,
     is_home: bool | None,
     inactive_usg_pool: float = 0.0,
+    inactive_potential_ast_pool: float = 0.0,
+    inactive_drives_pool: float = 0.0,
     prop_type: str = "points",
 ) -> dict:
     """
@@ -1680,6 +1682,7 @@ def _build_xgb_features(
     # xPPS = expected pts per shot from weighted drive/pullup/catch-shoot FG%.
     # Positive = player over-performing their shot mix; negative = under-performing.
     _LEAGUE_AVG_TS_TRAIN = 0.559   # 2024-25 NBA avg TS% — matches training proxy baseline
+    xPPS_base = None
     efficiency_delta = None
     if l5_ts is not None:
         if tracking_row:
@@ -1694,6 +1697,7 @@ def _build_xgb_features(
                     (_cs_fga / _t_fga) * float(tracking_row.get("catchShootEfgPct", 0) or 0)
                 )
                 if _xpps > 0:
+                    xPPS_base        = round(_xpps, 4)
                     efficiency_delta = round(float(l5_ts) - _xpps, 4)
         if efficiency_delta is None:
             # Fallback: compare to league-average TS% (same as training proxy)
@@ -1756,14 +1760,19 @@ def _build_xgb_features(
         "ewma_min":          ewma_min_v,
         # Usage redistribution pool
         "inactive_usg_pool": float(inactive_usg_pool) if inactive_usg_pool else 0.0,
-        # ── Tracking-derived features (new — require retrained models to activate) ──
-        # efficiency_delta: player TS% vs shot-difficulty-adjusted xPPS (or vs league avg)
-        "efficiency_delta":  efficiency_delta,
+        # ── Tracking-derived features ─────────────────────────────────────────
         # Opponent scheme concessions from LeagueDashPtTeamDefend
         "fg3_vs_avg":        feat_fg3_vs_avg,
         "rim_vs_avg":        feat_rim_vs_avg,
+        # Shot-quality baseline from Drives/PullUp/CatchShoot weighted eFG%
+        "xPPS_base":         xPPS_base,
+        # Player TS% vs xPPS (positive = outperforming shot mix; regression signal)
+        "efficiency_delta":  efficiency_delta,
         # Assist creation volume from passing tracking
         "l5_potential_ast":  l5_potential_ast,
+        # Multi-dimensional inactive teammate pools
+        "inactive_potential_ast_pool": float(inactive_potential_ast_pool),
+        "inactive_drives_pool":        float(inactive_drives_pool),
         # Diagnostic — visible in xgb_features_debug
         "_proj_min":         projected_min,
         "_hist_min":         l5_min_v,
@@ -2094,10 +2103,13 @@ def post_project():
     # ── Pre-compute inactive_usg_pool for XGBoost feature ────────────────────
     # Sum the rolling USG proxies of teammates who are OUT tonight.
     # Uses injury map + players_cache USG rates available at runtime.
-    _inactive_usg_pool = 0.0
+    _inactive_usg_pool          = 0.0
+    _inactive_potential_ast_pool = 0.0
+    _inactive_drives_pool        = 0.0
     try:
         _inj_map_pre, _ = _build_effective_injury_map()
         _player_team = player.get("team", "").upper()
+        _t_cache = (_cache_get("tracking") or {}).get("tracking", {})
         for _tname, _tdata in players_cache.items():
             if _tname == resolved_name:
                 continue
@@ -2105,7 +2117,7 @@ def post_project():
                 continue
             _status = _inj_map_pre.get(_tname, "").upper()
             if _status in ("OUT", "DNP", "INACTIVE"):
-                # USG proxy: FGA + 0.44*FTA + TOV — approximate from player stats
+                # USG proxy: FGA + 0.44*FTA + TOV
                 _rs = (_cache_get("players") or {}).get("players", {}).get(_tname, {})
                 _usg_approx = (
                     float(_rs.get("fga") or 0) +
@@ -2113,6 +2125,10 @@ def post_project():
                     float(_rs.get("tov") or _rs.get("to") or 0)
                 )
                 _inactive_usg_pool += _usg_approx
+                # Tracking pools — creation and drive-pressure voids from absences
+                _t_row = _t_cache.get(_tname, {})
+                _inactive_potential_ast_pool += float(_t_row.get("potentialAst", 0) or 0)
+                _inactive_drives_pool        += float(_t_row.get("driveFga",     0) or 0)
     except Exception:
         pass
 
@@ -2126,6 +2142,8 @@ def post_project():
                 own_team_data, opp_team_data,
                 l5_avg, l5_min, l5_stat_values, rest_days, is_home,
                 inactive_usg_pool=_inactive_usg_pool,
+                inactive_potential_ast_pool=_inactive_potential_ast_pool,
+                inactive_drives_pool=_inactive_drives_pool,
                 prop_type=prop_type,
             )
             xgb_out = _xgb_predict(_xgb_prop_key, feats)

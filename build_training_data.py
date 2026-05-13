@@ -29,7 +29,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 try:
-    from nba_api.stats.endpoints import leaguegamelog
+    from nba_api.stats.endpoints import leaguegamelog, leaguedashptstats
 except ImportError:
     print("Missing dependency — run: pip install nba_api pandas numpy pyarrow")
     sys.exit(1)
@@ -41,6 +41,17 @@ SLEEP_SEC    = 1.0          # rate-limit pause between API calls
 MIN_GP_PRIOR = 5            # drop rows where player has < 5 prior games (L5 invalid)
 CACHE_DIR    = "data_cache"
 OUTPUT_FILE  = "training_data.parquet"
+
+# Maps each training season to the prior season whose tracking stats we fetch once.
+# Zero leakage: a 2023-24 game row uses only 2022-23 full-season tracking.
+SEASON_PRIOR = {
+    "2022-23": "2021-22",
+    "2023-24": "2022-23",
+    "2024-25": "2023-24",
+}
+_TRACKING_MEASURE_TYPES = ["Drives", "PullUpShot", "CatchShoot", "Passing"]
+
+_LEAGUE_AVG_TS_TRAIN = 0.559   # 2024-25 NBA avg TS% — xPPS fallback baseline
 
 
 def _fetch(season: str, season_type: str, retries: int = 3) -> pd.DataFrame:
@@ -69,6 +80,110 @@ def _fetch(season: str, season_type: str, retries: int = 3) -> pd.DataFrame:
             time.sleep(wait)
     print(f"  FAILED after {retries} attempts — skipping")
     return pd.DataFrame()
+
+
+def _fetch_tracking_season(season: str, measure_type: str, retries: int = 3) -> pd.DataFrame:
+    """
+    Fetch full-season LeagueDashPtStats for one measure type, with caching.
+    Only Regular Season — full-season archetypes are more stable than small playoff samples.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    fpath = os.path.join(CACHE_DIR, f"tracking_{season}_{measure_type}.parquet")
+    if os.path.exists(fpath):
+        print(f"  cache hit  → {fpath}")
+        return pd.read_parquet(fpath)
+    for attempt in range(retries):
+        try:
+            time.sleep(SLEEP_SEC)
+            df = leaguedashptstats.LeagueDashPtStats(
+                season=season,
+                season_type_all_star="Regular Season",
+                per_mode_simple="PerGame",
+                pt_measure_type=measure_type,
+                player_or_team="Player",
+                timeout=90,
+            ).get_data_frames()[0]
+            df.to_parquet(fpath, index=False)
+            print(f"  fetched tracking {season} / {measure_type}: {len(df)} players")
+            return df
+        except Exception as exc:
+            wait = 3 * (attempt + 1)
+            print(f"  attempt {attempt+1} failed ({exc}), retrying in {wait}s…")
+            time.sleep(wait)
+    print(f"  FAILED tracking {season} / {measure_type}")
+    return pd.DataFrame()
+
+
+def _build_tracking_prior_lookup() -> dict:
+    """
+    Fetch prior-season full-season tracking for every training season and build
+    a two-level lookup:  tracking_prior[prior_season][player_id] = {xPPS_base, potentialAst, drivePg}
+
+    Uses Regular Season final splits only — prior-season archetypes are highly stable YoY
+    (shot diet / passing role) and this avoids daily scraping / rate-limit issues.
+    """
+    prior_seasons = sorted(set(SEASON_PRIOR.values()))  # ["2021-22", "2022-23", "2023-24"]
+    tracking_prior = {}
+
+    for prior_season in prior_seasons:
+        print(f"\nFetching prior-season tracking for {prior_season}…")
+        drives_df  = _fetch_tracking_season(prior_season, "Drives")
+        pullup_df  = _fetch_tracking_season(prior_season, "PullUpShot")
+        cs_df      = _fetch_tracking_season(prior_season, "CatchShoot")
+        passing_df = _fetch_tracking_season(prior_season, "Passing")
+
+        # Index each measure by PLAYER_ID
+        def _idx(df):
+            if df.empty or "PLAYER_ID" not in df.columns:
+                return {}
+            return df.set_index("PLAYER_ID").to_dict("index")
+
+        d_idx  = _idx(drives_df)
+        pu_idx = _idx(pullup_df)
+        cs_idx = _idx(cs_df)
+        pa_idx = _idx(passing_df)
+
+        all_pids = set(d_idx) | set(pu_idx) | set(cs_idx) | set(pa_idx)
+        lookup = {}
+
+        for pid in all_pids:
+            d  = d_idx.get(pid,  {})
+            pu = pu_idx.get(pid, {})
+            c  = cs_idx.get(pid, {})
+            pa = pa_idx.get(pid, {})
+
+            d_fga  = float(d.get("DRIVE_FGA",          0) or 0)
+            pu_fga = float(pu.get("PULL_UP_FGA",        0) or 0)
+            cs_fga = float(c.get("CATCH_SHOOT_FGA",     0) or 0)
+            t_fga  = d_fga + pu_fga + cs_fga
+
+            if t_fga > 0:
+                d_eff  = float(d.get("DRIVE_FG_PCT",          0) or 0)
+                pu_eff = float(pu.get("PULL_UP_EFG_PCT",       0) or 0)
+                cs_eff = float(c.get("CATCH_SHOOT_EFG_PCT",    0) or 0)
+                # Weighted harmonic of tracked shot efficiency — same formula as server.py
+                # inference path. Multiply by 2 to convert eFG% → points-per-shot units.
+                xPPS = 2.0 * (
+                    (d_fga  / t_fga) * d_eff +
+                    (pu_fga / t_fga) * pu_eff +
+                    (cs_fga / t_fga) * cs_eff
+                )
+            else:
+                xPPS = None
+
+            potential_ast = float(pa.get("POTENTIAL_AST", 0) or 0) if pa else 0.0
+            drive_pg      = d_fga  # drives per game ≈ drive FGA per game (best proxy available)
+
+            lookup[int(pid)] = {
+                "xPPS_base":     xPPS,
+                "potentialAst":  potential_ast,
+                "drivePg":       drive_pg,
+            }
+
+        tracking_prior[prior_season] = lookup
+        print(f"  Built tracking lookup for {prior_season}: {len(lookup)} players")
+
+    return tracking_prior
 
 
 def _parse_min(val) -> float:
@@ -159,25 +274,30 @@ def _per_player(grp: pd.DataFrame) -> pd.DataFrame:
     return grp
 
 
-def _compute_inactive_usg_pool(df: pd.DataFrame) -> pd.Series:
+def _compute_inactive_pool(
+    df: pd.DataFrame,
+    value_lookup: dict,   # (player_id, game_date) → scalar  OR  (player_id, season) → scalar
+    col_name: str,
+    key_mode: str = "date",   # "date" or "season"
+) -> pd.Series:
     """
-    For each player-game, compute the sum of rolling USG proxies of teammates
-    who were expected to play (appeared in any of the last 10 games for that team)
-    but did NOT play (0 MIN or absent from the game log).
+    Generic inactive-teammate pool computation.
 
-    Vectorized implementation — avoids iterrows() for speed on 80k+ rows.
+    For each player-game, sums `value_lookup[key]` for every teammate who was
+    expected to play but did NOT appear (0 MIN or absent from that game's log).
+
+    key_mode="date":   key = (player_id, game_date)   — rolling box-score values
+    key_mode="season": key = (player_id, season)       — prior-season tracking values
     """
-    print("  Computing inactive_usg_pool…")
+    label = col_name
+    print(f"  Computing {label}…")
 
-    # Active player set per (GAME_ID, TEAM_ABBREVIATION)
     played_df = df[df["MIN"] > 0][["GAME_ID", "GAME_DATE", "TEAM_ABBREVIATION", "PLAYER_ID"]].copy()
     game_team_active = (
         played_df.groupby(["GAME_ID", "TEAM_ABBREVIATION"])["PLAYER_ID"]
         .apply(set)
-    )  # Series indexed by (GAME_ID, TEAM_ABBREVIATION)
+    )
 
-    # Build expected roster per (TEAM_ABBREVIATION, GAME_DATE) using prior 10 games
-    # Explicit loop per team to avoid pandas 2.x groupby/apply column-dropping issue
     team_date_active = (
         played_df.groupby(["TEAM_ABBREVIATION", "GAME_DATE"])["PLAYER_ID"]
         .apply(set)
@@ -185,7 +305,7 @@ def _compute_inactive_usg_pool(df: pd.DataFrame) -> pd.Series:
         .rename(columns={"PLAYER_ID": "active_set"})
     )
 
-    roster_lookup = {}   # (team, game_date) → frozenset of expected player IDs
+    roster_lookup = {}
     for team, grp in team_date_active.groupby("TEAM_ABBREVIATION"):
         grp = grp.sort_values("GAME_DATE").reset_index(drop=True)
         for i in range(len(grp)):
@@ -193,33 +313,35 @@ def _compute_inactive_usg_pool(df: pd.DataFrame) -> pd.Series:
             roster = frozenset().union(*prior_sets) if len(prior_sets) > 0 else frozenset()
             roster_lookup[(team, grp.at[i, "GAME_DATE"])] = roster
 
-    # USG proxy lookup: (PLAYER_ID, GAME_DATE) → pre-game rolling USG proxy
-    usg_ser = df.set_index(["PLAYER_ID", "GAME_DATE"])["l5_usg_proxy"].dropna()
-    usg_lookup = usg_ser.to_dict()
-
-    # Vectorized pool computation using numpy arrays
     teams      = df["TEAM_ABBREVIATION"].values
     game_ids   = df["GAME_ID"].values
     player_ids = df["PLAYER_ID"].values
     dates      = df["GAME_DATE"].values
+    seasons    = df["season"].values
 
     pool_values = np.zeros(len(df), dtype=np.float32)
     for i in range(len(df)):
-        key_team  = (teams[i], dates[i])
-        expected  = roster_lookup.get(key_team, frozenset())
+        key_team = (teams[i], dates[i])
+        expected = roster_lookup.get(key_team, frozenset())
         if not expected:
             continue
         active   = game_team_active.get((game_ids[i], teams[i]), set())
         inactive = expected - active - {player_ids[i]}
-        pool_values[i] = sum(
-            usg_lookup.get((pid, dates[i]), 0.0) or 0.0
-            for pid in inactive
-        )
+        for pid in inactive:
+            if key_mode == "date":
+                val = value_lookup.get((int(pid), dates[i]), 0.0) or 0.0
+            else:
+                val = value_lookup.get((int(pid), seasons[i]), 0.0) or 0.0
+            pool_values[i] += float(val)
 
-    return pd.Series(pool_values, index=df.index, name="inactive_usg_pool")
+    return pd.Series(pool_values, index=df.index, name=col_name)
 
 
 def main():
+    # ── 0. Fetch prior-season tracking archetype lookups ──────────────────────
+    # One full-season fetch per prior season — no daily scraping, no rate limits.
+    tracking_prior = _build_tracking_prior_lookup()
+
     # ── 1. Fetch all seasons ──────────────────────────────────────────────────
     frames = []
     for season in SEASONS:
@@ -254,12 +376,11 @@ def main():
     # Venue
     raw["is_home"] = raw["MATCHUP"].str.contains(r"vs\.", na=False).astype(int)
 
-    # Per-game TS% only — usg_prox removed (FGA not cleanly available at inference)
+    # Per-game TS%
     denom = 2 * (raw["FGA"] + 0.44 * raw["FTA"])
     raw["ts_pct"] = np.where(denom > 0, raw["PTS"] / denom, np.nan)
 
     # ── 3. Build opponent defensive efficiency proxy ───────────────────────────
-    # Aggregate player logs to team totals per game
     agg_cols = {"team_pts": ("PTS", "sum"), "team_fga": ("FGA", "sum")}
     if "FG3A" in raw.columns:
         agg_cols["team_fg3a"] = ("FG3A", "sum")
@@ -267,7 +388,6 @@ def main():
         agg_cols["team_fgm"] = ("FGM", "sum")
     team_game = raw.groupby(["GAME_ID", "TEAM_ABBREVIATION", "GAME_DATE"]).agg(**agg_cols).reset_index()
 
-    # Self-join: each team row gets the opponent's stats (= what this team allowed)
     join_cols = ["GAME_ID", "TEAM_ABBREVIATION", "team_pts", "team_fga"]
     if "team_fg3a" in team_game.columns:
         join_cols.append("team_fg3a")
@@ -278,7 +398,6 @@ def main():
     tg = tg.rename(columns={"team_pts_opp": "pts_allowed", "team_fga_opp": "opp_fga"})
     tg = tg.sort_values(["TEAM_ABBREVIATION", "GAME_DATE"])
 
-    # Rolling 10-game defensive and pace metrics (prior games only)
     tg["opp_def_roll10"]  = tg.groupby("TEAM_ABBREVIATION")["pts_allowed"].transform(
         lambda x: x.shift(1).rolling(10, min_periods=3).mean()
     )
@@ -286,14 +405,8 @@ def main():
         lambda x: x.shift(1).rolling(10, min_periods=3).mean()
     )
 
-    # fg3_vs_avg proxy: rolling opponent 3PA/FGA rate vs league average.
-    # Positive = team allows more 3PA (weak perimeter D); negative = fewer 3PA.
-    # rim_vs_avg proxy: rolling opponent FG% vs league average.
-    # Positive = team allows higher FG% (weak interior D); negative = stronger D.
-    # NOTE: after the rename above, "opp_fga" = what this team's opponent attempted.
-    #       "team_fg3a_opp" and "team_fgm_opp" are still the un-renamed suffix columns.
-    _LEAGUE_AVG_FG3A_RATE = 0.37   # ~37% of FGA are 3PA in 2024-25 NBA
-    _LEAGUE_AVG_FG_PCT    = 0.470  # ~47% overall FG% in 2024-25 NBA
+    _LEAGUE_AVG_FG3A_RATE = 0.37
+    _LEAGUE_AVG_FG_PCT    = 0.470
     if "team_fg3a_opp" in tg.columns:
         tg["opp_fg3a_rate"] = tg["team_fg3a_opp"] / tg["opp_fga"].replace(0, np.nan)
         tg["fg3_vs_avg"] = tg.groupby("TEAM_ABBREVIATION")["opp_fg3a_rate"].transform(
@@ -310,13 +423,11 @@ def main():
     else:
         tg["rim_vs_avg"] = np.nan
 
-    # Lookup table: game_id + player team → rolling opponent defensive stats
     opp_lookup_cols = ["GAME_ID", "TEAM_ABBREVIATION", "opp_def_roll10", "opp_pace_roll10",
                        "fg3_vs_avg", "rim_vs_avg"]
     opp_lookup = tg[[c for c in opp_lookup_cols if c in tg.columns]].copy()
 
     # ── 4. Per-player rolling features ────────────────────────────────────────
-    # Explicit loop avoids pandas 2.x groupby/apply key-dropping behaviour.
     print("Computing per-player rolling features…")
     raw = raw.sort_values(["PLAYER_ID", "GAME_DATE"]).reset_index(drop=True)
     pieces = [_per_player(grp) for _, grp in raw.groupby("PLAYER_ID")]
@@ -325,22 +436,75 @@ def main():
     # ── 5. Join opponent context ───────────────────────────────────────────────
     raw = raw.merge(opp_lookup, on=["GAME_ID", "TEAM_ABBREVIATION"], how="left")
 
-    # ── 5b. Compute inactive_usg_pool ─────────────────────────────────────────
-    # Must run AFTER per-player features (needs l5_usg_proxy) and AFTER opp join.
-    raw["inactive_usg_pool"] = _compute_inactive_usg_pool(raw)
+    # ── 5b. Map prior-season tracking archetypes ──────────────────────────────
+    # For each game row, look up the player's prior-season tracking stats.
+    # Zero leakage: 2023-24 game → 2022-23 final splits.
+    print("  Mapping prior-season tracking archetypes…")
+    raw["PLAYER_ID_int"] = raw["PLAYER_ID"].astype(int)
+
+    def _get_prior_tracking(row, field):
+        prior_season = SEASON_PRIOR.get(row["season"])
+        if not prior_season:
+            return np.nan
+        lookup = tracking_prior.get(prior_season, {})
+        entry  = lookup.get(row["PLAYER_ID_int"])
+        if entry is None:
+            return np.nan
+        return entry.get(field)
+
+    raw["xPPS_base"]    = raw.apply(lambda r: _get_prior_tracking(r, "xPPS_base"),   axis=1)
+    raw["prior_pot_ast"]= raw.apply(lambda r: _get_prior_tracking(r, "potentialAst"), axis=1)
+    raw["prior_drives"] = raw.apply(lambda r: _get_prior_tracking(r, "drivePg"),      axis=1)
+
+    # efficiency_delta: player's recent TS% vs their prior-season shot-quality baseline.
+    # At inference: server.py computes l5_ts - xPPS from live tracking (same definition).
+    # Fallback to league-avg baseline when prior tracking is unavailable (rookies, etc.).
+    raw["efficiency_delta"] = np.where(
+        raw["xPPS_base"].notna(),
+        (raw["l5_ts"] - raw["xPPS_base"]).fillna(0.0),
+        (raw["l5_ts"] - _LEAGUE_AVG_TS_TRAIN).fillna(0.0),
+    )
+
+    # l5_potential_ast: real prior-season potentialAst/g replaces the l5_ast × 3.33 proxy.
+    # At inference: server.py uses live potentialAst/g from passing tracking.
+    raw["l5_potential_ast"] = np.where(
+        raw["prior_pot_ast"].notna() & (raw["prior_pot_ast"] > 0),
+        raw["prior_pot_ast"],
+        (raw["l5_ast"] * 3.33).fillna(0.0),   # proxy fallback for rookies / no prior data
+    )
+
+    # ── 5c. Compute inactive pools ────────────────────────────────────────────
+    # inactive_usg_pool: sum of absent teammates' rolling USG proxies
+    usg_ser     = raw.set_index(["PLAYER_ID", "GAME_DATE"])["l5_usg_proxy"].dropna()
+    usg_lookup  = {(int(pid), date): v for (pid, date), v in usg_ser.items()}
+    raw["inactive_usg_pool"] = _compute_inactive_pool(raw, usg_lookup, "inactive_usg_pool", key_mode="date")
     print(f"  inactive_usg_pool: mean={raw['inactive_usg_pool'].mean():.2f}  "
           f"max={raw['inactive_usg_pool'].max():.2f}  "
-          f"non-zero={( raw['inactive_usg_pool'] > 0).mean():.1%}")
+          f"non-zero={(raw['inactive_usg_pool'] > 0).mean():.1%}")
 
-    # ── 5c. Tracking-derived ML feature proxies ────────────────────────────────
-    # efficiency_delta: player's L5 TS% vs NBA average (proxy for shot quality delta).
-    # At inference, replaced by actual (l5_ts - xPPS) computed from tracking splits.
-    _LEAGUE_AVG_TS = 0.559   # 2024-25 NBA avg TS% — used as training baseline
-    raw["efficiency_delta"] = (raw["l5_ts"] - _LEAGUE_AVG_TS).fillna(0.0)
+    # inactive_potential_ast_pool: sum of absent teammates' prior-season potentialAst/g
+    # Captures the void in creation volume when an elite passer is scratched.
+    pa_lookup = {}
+    for _, row in raw[["PLAYER_ID_int", "season", "prior_pot_ast"]].drop_duplicates().iterrows():
+        if pd.notna(row["prior_pot_ast"]):
+            pa_lookup[(int(row["PLAYER_ID_int"]), row["season"])] = float(row["prior_pot_ast"])
+    raw["inactive_potential_ast_pool"] = _compute_inactive_pool(
+        raw, pa_lookup, "inactive_potential_ast_pool", key_mode="season"
+    )
+    print(f"  inactive_potential_ast_pool: mean={raw['inactive_potential_ast_pool'].mean():.2f}  "
+          f"non-zero={(raw['inactive_potential_ast_pool'] > 0).mean():.1%}")
 
-    # l5_potential_ast: creation volume proxy = l5_ast × 3.33 (AST/potAST ≈ 0.30 NBA avg).
-    # At inference, replaced by actual potentialAst/g from passing tracking endpoint.
-    raw["l5_potential_ast"] = (raw["l5_ast"] * 3.33).fillna(0.0)
+    # inactive_drives_pool: sum of absent teammates' prior-season drives/g
+    # Captures the void in paint pressure when a drive-heavy creator is scratched.
+    drives_lookup = {}
+    for _, row in raw[["PLAYER_ID_int", "season", "prior_drives"]].drop_duplicates().iterrows():
+        if pd.notna(row["prior_drives"]):
+            drives_lookup[(int(row["PLAYER_ID_int"]), row["season"])] = float(row["prior_drives"])
+    raw["inactive_drives_pool"] = _compute_inactive_pool(
+        raw, drives_lookup, "inactive_drives_pool", key_mode="season"
+    )
+    print(f"  inactive_drives_pool: mean={raw['inactive_drives_pool'].mean():.2f}  "
+          f"non-zero={(raw['inactive_drives_pool'] > 0).mean():.1%}")
 
     # ── 6. Define targets ─────────────────────────────────────────────────────
     raw["target_pts"] = raw["PTS"]
@@ -359,14 +523,17 @@ def main():
         "std_pts", "std_reb", "std_ast", "std_min",
         "gp_prior",
         "opp_def_roll10", "opp_pace_roll10",
-        # EWMA recency features (new — halflife=3 games)
+        # EWMA recency features
         "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
-        # Usage redistribution pool (new — sum of absent teammates' USG proxy)
+        # Usage redistribution pools
         "inactive_usg_pool",
-        # Tracking-derived features (proxied from box-score for training)
+        "inactive_potential_ast_pool",
+        "inactive_drives_pool",
+        # Tracking-derived features
         "fg3_vs_avg", "rim_vs_avg",       # opponent scheme concessions
-        "efficiency_delta",               # player TS% vs expected (shot quality)
-        "l5_potential_ast",               # creation volume proxy
+        "xPPS_base",                       # prior-season shot-quality baseline
+        "efficiency_delta",               # l5_ts - xPPS_base (regression signal)
+        "l5_potential_ast",               # prior-season creation volume
         # Targets
         "target_pts", "target_reb", "target_ast",
         # Keep actual MIN for analysis — NOT a training feature (future leakage)
@@ -381,10 +548,12 @@ def main():
     print(f"Seasons:    {sorted(out['season'].unique())}")
     print(f"Players:    {out['PLAYER_ID'].nunique():,}")
     print(f"\nNaN counts in key features:")
-    feat_cols = ["l5_pts", "l5_reb", "l5_ast", "l5_min",
-                 "ewma_pts", "ewma_reb", "ewma_ast",
-                 "inactive_usg_pool", "opp_def_roll10", "opp_pace_roll10"]
-    print(out[[c for c in feat_cols if c in out.columns]].isna().sum().to_string())
+    feat_cols_diag = ["l5_pts", "l5_reb", "l5_ast", "l5_min",
+                      "ewma_pts", "ewma_reb", "ewma_ast",
+                      "inactive_usg_pool", "opp_def_roll10", "opp_pace_roll10",
+                      "xPPS_base", "efficiency_delta", "l5_potential_ast",
+                      "inactive_potential_ast_pool", "inactive_drives_pool"]
+    print(out[[c for c in feat_cols_diag if c in out.columns]].isna().sum().to_string())
 
     out.to_parquet(OUTPUT_FILE, index=False)
     print(f"\nSaved → {OUTPUT_FILE}")
@@ -398,10 +567,15 @@ def main():
         "opp_def_roll10", "opp_pace_roll10",
         "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
         "inactive_usg_pool",
-        # Tracking-derived features (proxied at training; real values at inference)
+        # Opponent scheme concessions
         "fg3_vs_avg", "rim_vs_avg",
+        # Tracking-derived features (prior-season archetypes at training; live values at inference)
+        "xPPS_base",
         "efficiency_delta",
         "l5_potential_ast",
+        # Multi-dimensional inactive teammate pools
+        "inactive_potential_ast_pool",
+        "inactive_drives_pool",
     ]
     medians = {c: float(out[c].median()) for c in feature_cols if c in out.columns}
     meta = {"feature_cols": feature_cols, "medians": medians}

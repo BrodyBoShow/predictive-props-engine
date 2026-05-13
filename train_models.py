@@ -56,14 +56,19 @@ FEATURE_COLS = [
     "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
     # Usage redistribution pool (sum of absent teammates' rolling USG proxy)
     "inactive_usg_pool",
-    # Tracking-derived features — box-score proxies at training, real values at inference
-    # fg3_vs_avg:        rolling opp 3PA/FGA rate - 0.37  (perimeter D quality)
-    # rim_vs_avg:        rolling opp FG% - 0.47            (interior D quality)
-    # efficiency_delta:  l5_ts - league_avg at training; l5_ts - xPPS at inference
-    # l5_potential_ast:  l5_ast × 3.33 at training; real potentialAst/g at inference
+    # Opponent scheme concessions
     "fg3_vs_avg", "rim_vs_avg",
+    # Tracking-derived features — prior-season archetypes at training; live values at inference
+    # xPPS_base:                  prior-season shot-diet quality (Drives/PullUp/CatchShoot weighted eFG%)
+    # efficiency_delta:           l5_ts - xPPS_base  (efficiency regression signal)
+    # l5_potential_ast:           prior-season potentialAst/g (creation volume)
+    # inactive_potential_ast_pool: sum of absent teammates' prior-season potentialAst/g
+    # inactive_drives_pool:        sum of absent teammates' prior-season drives/g
+    "xPPS_base",
     "efficiency_delta",
     "l5_potential_ast",
+    "inactive_potential_ast_pool",
+    "inactive_drives_pool",
 ]
 
 TARGETS = {
