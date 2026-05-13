@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.20.1"  # fix: tracking bullet restored as informational when XGBoost active; heuristic adj still fires on non-XGB path
+SERVER_VERSION = "v6.21.0"  # feat: prior-season tracking archetypes — xPPS_base, real potentialAst, inactive drives/ast pools
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
