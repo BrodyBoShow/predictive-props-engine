@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.24.0"  # feat: 3PA / FGA / 2PA props — new stat fields, shot-volume adj, all calibrations wired
+SERVER_VERSION = "v6.25.0"  # feat: FGM prop + splits/live-line — completes 3PA/FGA/2PA/FGM attempt-prop suite
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -299,8 +299,9 @@ def _stat_row(r):
         "ft":     _pct(r.get("FT_PCT")),
         "min":    _f(r.get("MIN", 0)),
         "gp":     _i(r.get("GP", 0)),
-        "fgapg":  _f(r.get("FGA", 0)),   # field goal attempts per game
+        "fgapg":  _f(r.get("FGA",  0)),  # field goal attempts per game
         "fg3apg": _f(r.get("FG3A", 0)),  # 3-point attempts per game
+        "fgmpg":  _f(r.get("FGM",  0)),  # field goals made per game
     }
 
 
@@ -1050,9 +1051,11 @@ _TS_BAD_THRESH         = 50.0   # TS% below this = inefficient
 _CLUTCH_LIFT_THRESH    = 0.20   # ±20% clutch divergence → meaningful signal
 _COUNTING_PROPS = ("points","assists","rebounds","steals","blocks",
                    "pra","pa","pr","ra","three_pointers",
-                   "three_point_attempts","field_goal_attempts","two_point_attempts")
+                   "three_point_attempts","field_goal_attempts","two_point_attempts",
+                   "field_goal_made")
 _SCORING_PROPS  = ("points","pra","pa","pr","three_pointers")
-_ATTEMPT_PROPS  = ("three_point_attempts","field_goal_attempts","two_point_attempts")
+_ATTEMPT_PROPS  = ("three_point_attempts","field_goal_attempts","two_point_attempts",
+                   "field_goal_made")
 
 
 # ── Analyst Narrative Generator ──────────────────────────────────────────────
@@ -1071,6 +1074,7 @@ _PROP_NOUN = {
     "three_point_attempts": ("3-point attempts",    "3PA total",             "3PA"),
     "field_goal_attempts":  ("field goal attempts", "FGA total",             "FGA"),
     "two_point_attempts":   ("2-point attempts",    "2PA total",             "2PA"),
+    "field_goal_made":      ("field goals made",    "FGM total",             "FGM"),
 }
 
 def _generate_analyst_narrative(
@@ -1802,6 +1806,9 @@ def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
     elif prop_type == "two_point_attempts":
         po_v = max(0.0, _s(po, "fgapg") - _s(po, "fg3apg"))
         rs_v = max(0.0, _s(rs, "fgapg") - _s(rs, "fg3apg"))
+    elif prop_type == "field_goal_made":
+        po_v = _s(po, "fgmpg")
+        rs_v = _s(rs, "fgmpg")
     else:
         key_map = {"points":"ppg","assists":"apg","rebounds":"rpg",
                    "steals":"spg","blocks":"bpg"}
@@ -2225,6 +2232,7 @@ _ODDS_MARKET_MAP = {
     "field_goal_attempts":  "player_field_goals_attempted",
     "three_point_attempts": "player_threes_attempted",
     "two_point_attempts":   "player_two_point_attempts",
+    "field_goal_made":      "player_field_goals",
 }
 
 _PRIMARY_BOOKS = {"draftkings", "fanduel", "betmgm", "caesars"}
@@ -2704,11 +2712,13 @@ def post_project():
             **{p: 1.0 for p in _SCORING_PROPS},
             "rebounds":             0.40,
             "assists":              0.40,
-            # Attempt props: general dEFF affects total opportunity; scale down
-            # since specific shot-diet adjustments (Adj 3b) handle the primary signal
+            # Attempt/make props: dEFF affects total opportunity; scale down
+            # since Adj 3b handles the specific shot-diet signal
             "field_goal_attempts":  0.35,
             "three_point_attempts": 0.25,
             "two_point_attempts":   0.30,
+            # FGM is affected by both volume (dEFF) and efficiency — full scoring scale
+            "field_goal_made":      0.70,
         }
         def_composite_pct = 0.0
         if prop_type in _DEF_COMPOSITE_PROPS and opp_team_data:
@@ -2803,15 +2813,19 @@ def post_project():
                 # rimVsAvg measures opponent rim FG% allowed delta; correlated with 2PA volume
                 shot_vol_pct = _soft_cap(rim_va / 0.45, 0.15)
             elif prop_type == "field_goal_attempts":
-                # FGA is split between 3PA and 2PA — blend both signals with equal weight
+                # FGA is split between 3PA and 2PA — blend both signals
                 shot_vol_pct = _soft_cap(fg3_va / 0.38 * 0.45 + rim_va / 0.45 * 0.35, 0.10)
+            elif prop_type == "field_goal_made":
+                # FGM = FGA × FG%. Both rim efficiency (fg%) and volume (fg3_va) apply.
+                # rimVsAvg is more predictive for makes (higher rim FG% conceded = more makes)
+                shot_vol_pct = _soft_cap(rim_va * 1.5 + fg3_va / 0.38 * 0.20, 0.12)
 
             if abs(shot_vol_pct) >= 0.005:
-                direction = "+" if shot_vol_pct > 0 else "-"
                 signal_desc = {
                     "three_point_attempts": f"fg3VsAvg {fg3_va:+.3f}",
                     "two_point_attempts":   f"rimVsAvg {rim_va:+.3f}",
                     "field_goal_attempts":  f"fg3VsAvg {fg3_va:+.3f} + rimVsAvg {rim_va:+.3f}",
+                    "field_goal_made":      f"rimVsAvg {rim_va:+.3f} + fg3VsAvg {fg3_va:+.3f}",
                 }.get(prop_type, "")
                 shot_vol_abs = round(corr * shot_vol_pct, 2)
                 drivers.append(
@@ -2904,6 +2918,7 @@ def post_project():
                              "three_point_attempts":"fg3apg",
                              "field_goal_attempts":"fgapg",
                              "two_point_attempts":("fgapg","fg3apg"),  # special: fga - fg3a
+                             "field_goal_made":"fgmpg",
                              }
                 k2 = key_map_2.get(prop_type)
                 if k2 and l5 > 0:
@@ -2969,7 +2984,7 @@ def post_project():
         splits_pct = 0.0
         if splits_row and is_home is not None and prop_type in (
             "points","assists","rebounds","pra","pa","pr","ra",
-            "three_point_attempts","field_goal_attempts","two_point_attempts",
+            "three_point_attempts","field_goal_attempts","two_point_attempts","field_goal_made",
         ):
             home = splits_row.get("home") or {}
             road = splits_row.get("road") or {}
@@ -2978,6 +2993,7 @@ def post_project():
                 "pra":["ppg","rpg","apg"], "pa":["ppg","apg"], "pr":["ppg","rpg"], "ra":["rpg","apg"],
                 "three_point_attempts":"fg3apg",
                 "field_goal_attempts":"fgapg",
+                "field_goal_made":"fgmpg",
             }
             k = key_map.get(prop_type)
             h_gp = int(home.get("gp") or 0)
