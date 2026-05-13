@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.22.0"  # feat: analyst narrative generator — human-readable prop breakdown in API response
+SERVER_VERSION = "v6.22.1"  # fix: narrative — correct po/rs stat keys (ppg/rpg/apg), opp fallback via game_ctx
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1114,22 +1114,37 @@ def _generate_analyst_narrative(
 
     # Pick the right stat column from player dicts based on prop
     _STAT_MAP = {
-        "points": ("pts", "pts", "pts"), "rebounds": ("reb", "reb", "reb"),
-        "assists": ("ast", "ast", "ast"), "three_pointers": ("fg3m", "fg3m", "fg3m"),
-        "pra": ("pra", "pra", "pra"), "pa": ("pa", "pa", "pa"),
-        "pr": ("pr", "pr", "pr"),     "ra": ("ra", "ra", "ra"),
-        "steals": ("stl", "stl", "stl"), "blocks": ("blk", "blk", "blk"),
+        "points":        ("ppg", "pts"),
+        "rebounds":      ("rpg", "reb"),
+        "assists":       ("apg", "ast"),
+        "three_pointers":("fg3m", "fg3mpg"),
+        "pra":           ("pra",),
+        "pa":            ("pa",),
+        "pr":            ("pr",),
+        "ra":            ("ra",),
+        "steals":        ("spg", "stl"),
+        "blocks":        ("bpg", "blk"),
     }
-    _keys = _STAT_MAP.get(prop_type, ("pts", "pts", "pts"))
+    _keys = _STAT_MAP.get(prop_type, ("ppg", "pts"))
     def _player_stat(d, keys=_keys):
+        if not d:
+            return 0.0
         for k in keys:
             v = d.get(k)
             if v is not None:
-                return float(v)
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
         return 0.0
 
-    po_avg = _player_stat(po) if po else 0.0
-    rs_avg = _player_stat(rs) if rs else 0.0
+    po_avg = _player_stat(po)
+    rs_avg = _player_stat(rs)
+
+    # Opponent — use opp_abbr when available; fall back to game_ctx team info
+    if not opp:
+        ctx_teams = (game_ctx or {}).get("teams", "")
+        opp = ctx_teams if ctx_teams else "tonight's opponent"
 
     trust  = (confidence_band or {}).get("trust_score", 50)
     cb_floor   = (confidence_band or {}).get("floor")
