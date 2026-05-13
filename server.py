@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.18.1"  # fix: shot-quality adj moved outside xgb gate — was skipped when XGBoost active
+SERVER_VERSION = "v6.19.0"  # fix: shot-quality gated behind xgb — was inflating XGB predictions by +1.5-1.8 pts
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1028,7 +1028,7 @@ _LEAGUE_AVG_REB_CONV        = 55.0   # % of rebound chances that convert (league
 _LEAGUE_AVG_DRIVE_FG_PCT    = 0.477  # FGA-weighted drive FG% (2025-26 PO)
 _LEAGUE_AVG_PULLUP_EFG_PCT  = 0.451  # FGA-weighted pull-up EFG% (2025-26 PO)
 _LEAGUE_AVG_CS_EFG_PCT      = 0.531  # FGA-weighted catch-&-shoot EFG% (2025-26 PO)
-_SHOT_QUAL_CAP              = 0.08   # ±8% max shot-quality adjustment for points
+_SHOT_QUAL_CAP              = 0.03   # ±3% max shot-quality adjustment for points (heuristic-only)
 _THREE_PT_RELY_THRESH  = 35.0   # % pts from 3s = "3pt-reliant" shooter
 _FG3_ELITE_DEF_THRESH  = -0.015 # fg3VsAvg ≤ this → elite 3pt defense
 _MATCHUP_SCALE         = 0.015  # +1.5% projection per +1.0 dEFF point increase
@@ -2576,11 +2576,12 @@ def post_project():
                    "usageAdj","playoffFormAdj","debutAdj","defMatchAdj"):
             breakdown[_k] = 0.0
 
-    # ADJUSTMENT 4b — SHOT QUALITY (points props, always fires — XGBoost doesn't encode EFG% by shot type)
-    # Weighted efficiency delta across drives (FG%), pull-ups (EFG%), catch-&-shoot (EFG%).
-    # Weight = each category's FGA share of total tracked FGA. Soft-capped at ±8%.
+    # ADJUSTMENT 4b — SHOT QUALITY (points props, only when XGBoost is NOT active)
+    # XGBoost already encodes scoring efficiency through L5/EWMA features.
+    # Shot quality only fires as supplementary calibration for players without
+    # recent game-log data (heuristic base). Cap ±3% to avoid large swings.
     shot_qual_adj = 0.0
-    if prop_type in _SCORING_PROPS and tracking_row:
+    if not _xgb_used and prop_type in _SCORING_PROPS and tracking_row:
         drive_fga  = float(tracking_row.get("driveFga",         0) or 0)
         pullup_fga = float(tracking_row.get("pullUpFga",         0) or 0)
         cs_fga     = float(tracking_row.get("catchShootFga",     0) or 0)
