@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.21.1"  # fix: league-avg fallback efficiencies in xPPS_base when zone FG% is 0
+SERVER_VERSION = "v6.21.2"  # fix: move XGBoost shot-qual info out of drivers[] into breakdown debug dict
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2688,16 +2688,18 @@ def post_project():
             )
             direction = "ABOVE" if eff_delta > 0 else "BELOW"
             if _xgb_used:
-                # Informational only — XGBoost already encoded efficiency_delta natively.
-                # Show the tracking breakdown so it's visible in analysis, no proj change.
-                drivers.append(
-                    f"Shot Quality Tracking (XGBoost native) — {resolved_name.title()} shoots "
-                    f"{abs(eff_delta)*100:.1f}% {direction} league avg across "
-                    f"drives ({drive_fga:.1f}/g @ {drive_eff:.1%} FG), "
-                    f"pull-ups ({pullup_fga:.1f}/g @ {pullup_eff:.1%} eFG), "
-                    f"catch-&-shoot ({cs_fga:.1f}/g @ {cs_eff:.1%} eFG). "
-                    f"Encoded in XGBoost prediction above — no separate adjustment."
-                )
+                # XGBoost already encoded efficiency_delta natively — no projection change.
+                # Store in breakdown dict for debug access; keep drivers[] clean for UI.
+                breakdown["xgb_shot_qual_debug"] = {
+                    "eff_delta_pct": round(eff_delta * 100, 2),
+                    "direction":     direction,
+                    "drive_fga":     round(drive_fga,  1),
+                    "drive_fg_pct":  round(drive_eff,  3),
+                    "pullup_fga":    round(pullup_fga, 1),
+                    "pullup_efg":    round(pullup_eff, 3),
+                    "cs_fga":        round(cs_fga,     1),
+                    "cs_efg":        round(cs_eff,     3),
+                }
             else:
                 shot_qual_pct = _soft_cap(eff_delta, _SHOT_QUAL_CAP)
                 shot_qual_adj = round(corr * shot_qual_pct, 2)
