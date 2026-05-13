@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.17.0"  # Fix: tracking fallback to 2024-25 when current season returns empty
+SERVER_VERSION = "v6.17.1"  # Fix: tracking missing player_or_team=Player param — was returning team rows
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -682,6 +682,7 @@ def _build_tracking():
                 season_type_all_star=stype,
                 per_mode_simple="PerGame",
                 pt_measure_type="Passing",
+                player_or_team="Player",
             ).get_data_frames()[0]
             _sleep()
             if not df.empty and "PLAYER_ID" in df.columns:
@@ -705,6 +706,7 @@ def _build_tracking():
                 season_type_all_star=stype,
                 per_mode_simple="PerGame",
                 pt_measure_type="Rebounding",
+                player_or_team="Player",
             ).get_data_frames()[0]
             _sleep()
             pid_col = next(
