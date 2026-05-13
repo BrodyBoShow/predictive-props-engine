@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.22.1"  # fix: narrative — correct po/rs stat keys (ppg/rpg/apg), opp fallback via game_ctx
+SERVER_VERSION = "v6.23.0"  # feat: narrative rewrite — fluid handicapper prose, series context injection, main-section UI
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1092,27 +1092,20 @@ def _generate_analyst_narrative(
     game_ctx,
 ) -> dict:
     """
-    Translate the computed projection data into professional handicapper prose.
-    Returns a dict with 'headline', 'paragraphs' (list), and 'full_text'.
-    All inputs are already computed — no API calls, no extra latency.
+    Translate computed projection data into professional handicapper prose.
+    Returns {headline, paragraphs[], full_text}.
     """
     pname   = player_name.title()
-    opp     = opponent.upper() if opponent else "tonight's opponent"
+    opp     = opponent.upper() if opponent else ""
     noun    = _PROP_NOUN.get(prop_type, (prop_type, prop_type, prop_type))
-    stat_w  = noun[0]   # "points", "rebounds", etc.
-    stat_w2 = noun[1]   # "scoring output", "rebounding total", etc.
+    stat_w  = noun[0]   # "points"
+    stat_w2 = noun[1]   # "scoring output"
 
-    over_lean  = book_line and projection > book_line
-    under_lean = book_line and projection < book_line
+    over_lean  = bool(book_line and projection > book_line)
+    under_lean = bool(book_line and projection < book_line)
     lean_str   = "OVER" if over_lean else ("UNDER" if under_lean else "HOLD")
     edge_pct   = abs(round((ev_edge or 0) * 100, 1))
 
-    po_avg  = float(po.get("pts") or po.get("reb") or po.get("ast") or 0) if po else 0
-    po_gp   = int(po.get("gp") or 0) if po else 0
-    rs_avg  = float(rs.get("pts") or rs.get("reb") or rs.get("ast") or 0) if rs else 0
-    rs_gp   = int(rs.get("gp") or 0) if rs else 0
-
-    # Pick the right stat column from player dicts based on prop
     _STAT_MAP = {
         "points":        ("ppg", "pts"),
         "rebounds":      ("rpg", "reb"),
@@ -1126,6 +1119,7 @@ def _generate_analyst_narrative(
         "blocks":        ("bpg", "blk"),
     }
     _keys = _STAT_MAP.get(prop_type, ("ppg", "pts"))
+
     def _player_stat(d, keys=_keys):
         if not d:
             return 0.0
@@ -1139,241 +1133,364 @@ def _generate_analyst_narrative(
         return 0.0
 
     po_avg = _player_stat(po)
+    po_gp  = int((po or {}).get("gp") or 0)
     rs_avg = _player_stat(rs)
+    rs_gp  = int((rs or {}).get("gp") or 0)
 
-    # Opponent — use opp_abbr when available; fall back to game_ctx team info
-    if not opp:
-        ctx_teams = (game_ctx or {}).get("teams", "")
-        opp = ctx_teams if ctx_teams else "tonight's opponent"
+    ctx        = game_ctx or {}
+    series_str = ctx.get("series", "")      # e.g. "Series tied 2-2"
+    game_title = ctx.get("game_title", "")  # e.g. "Game 5"
+    spread     = ctx.get("spread")          # negative = player's team favored
+    total      = ctx.get("total")
 
-    trust  = (confidence_band or {}).get("trust_score", 50)
-    cb_floor   = (confidence_band or {}).get("floor")
-    cb_ceiling = (confidence_band or {}).get("ceiling")
-    mc_over    = (monte_carlo    or {}).get("prob_over")
-    mc_under   = (monte_carlo    or {}).get("prob_under")
+    trust     = (confidence_band or {}).get("trust_score", 50)
+    cb_floor  = (confidence_band or {}).get("floor")
+    cb_ceil   = (confidence_band or {}).get("ceiling")
+    mc_over   = (monte_carlo or {}).get("prob_over")
+    mc_under  = (monte_carlo or {}).get("prob_under")
 
     opp_def  = feats.get("opp_def_roll10")
     opp_pace = feats.get("opp_pace_roll10")
     fg3_vs   = feats.get("fg3_vs_avg")
     rim_vs   = feats.get("rim_vs_avg")
+    xpps     = feats.get("xPPS_base")
+    eff_d    = feats.get("efficiency_delta")
+    pot_ast  = feats.get("l5_potential_ast")
 
     paragraphs = []
 
-    # ── P1: Opening hook ──────────────────────────────────────────────────────
+    # ── P1: Series stakes + side declaration ─────────────────────────────────
+    # Open with the highest-stakes context available, then commit to the side.
+
+    # Build series/game context opener
+    series_opener = ""
+    if series_str and game_title:
+        sg = f"{game_title}, {series_str.lower()}"
+        if "eliminat" in series_str.lower() or "leads 3" in series_str.lower():
+            series_opener = f"With their season on the line in {sg}, "
+        elif "tied" in series_str.lower():
+            series_opener = f"In a pivotal {sg} — winner takes the series momentum — "
+        else:
+            series_opener = f"Heading into {sg}, "
+    elif game_title:
+        series_opener = f"In {game_title}, "
+
+    opp_display = opp if opp else "tonight's opponent"
+
     if book_line and book_line > 0:
-        gap_str = f"{abs(projection - book_line):.2f}"
-        if over_lean:
-            open_lean = f"our model projects {pname} to clear the {book_line} {stat_w} line, carrying a {gap_str}-unit edge heading into tip-off"
-        else:
-            open_lean = f"our model projects {pname} to fall short of the {book_line} {stat_w} line by {gap_str} units, establishing an UNDER lean"
+        gap = abs(projection - book_line)
         if edge_pct >= 5:
-            conviction = "a high-conviction edge"
+            conviction_phrase = "a high-conviction edge"
         elif edge_pct >= 3:
-            conviction = "a medium-conviction edge"
+            conviction_phrase = "a medium-conviction lean"
         else:
-            conviction = "a thin but trackable edge"
-        p1 = (
-            f"{pname} ({team}) takes the floor tonight against {opp} with {conviction} on the {stat_w2} prop. "
-            f"Projecting to {projection} {stat_w}, {open_lean}. "
-            f"The model registers a +{edge_pct}% expected-value gap vs the current book number."
-        )
+            conviction_phrase = "a thin but trackable edge"
+        if over_lean:
+            side_clause = (
+                f"the model lands on {pname} OVER {book_line} {stat_w} — "
+                f"projecting {projection:.1f}, a {gap:.1f}-unit gap that constitutes {conviction_phrase} "
+                f"at {edge_pct}% expected value"
+            )
+        else:
+            side_clause = (
+                f"the model lands on {pname} UNDER {book_line} {stat_w} — "
+                f"projecting {projection:.1f}, falling {gap:.1f} short of the number "
+                f"with a {edge_pct}% EV edge on the fade"
+            )
+        if spread is not None:
+            fav_clause = f" ({team} {'favored by' if spread < 0 else 'dogs at'} {abs(spread):.1f})"
+        else:
+            fav_clause = ""
+        if total is not None:
+            total_clause = f" in a game with a {total}-point total"
+        else:
+            total_clause = ""
+        p1 = f"{series_opener}{side_clause}{fav_clause}{total_clause}."
     else:
+        opp_clause = f" against {opp_display}" if opp_display != "tonight's opponent" else " tonight"
         p1 = (
-            f"{pname} ({team}) enters tonight's matchup against {opp} projecting to {projection} {stat_w}. "
-            f"No live line available for EV calculation, but the model's correlated output sits at {projection}."
+            f"{series_opener}{pname} ({team}) projects to {projection:.1f} {stat_w}{opp_clause}. "
+            f"No live line available for EV calculation — projection stands on model output alone."
         )
     paragraphs.append(p1)
 
-    # ── P2: Baseline & form context ───────────────────────────────────────────
-    parts = []
-    if po_gp >= 5 and po_avg > 0:
-        sample_desc = "across a solid playoff sample" if po_gp >= 10 else "in a growing playoff sample"
-        parts.append(f"averaging {po_avg:.1f} {stat_w} {sample_desc} of {po_gp} appearances this postseason")
-    if rs_avg > 0 and rs_gp >= 10:
-        parts.append(f"backed by a {rs_avg:.1f} regular-season average over {rs_gp} games")
-    if l5_avg is not None and l5_avg > 0 and po_avg > 0:
-        pct_diff = (l5_avg - po_avg) / po_avg
-        if pct_diff > 0.10:
-            form_desc = f"trending upward with a {l5_avg:.1f} L5 average — running {abs(pct_diff)*100:.0f}% above his playoff baseline"
-        elif pct_diff < -0.10:
-            form_desc = f"running below his playoff average recently, posting just {l5_avg:.1f} over his last 5 — a {abs(pct_diff)*100:.0f}% dip from his postseason norm"
-        else:
-            form_desc = f"tracking close to his playoff average in recent games ({l5_avg:.1f} L5)"
-        parts.append(form_desc)
+    # ── P2: Player form & baseline ────────────────────────────────────────────
+    # Weave together playoff average, RS anchor, L5 trend, rest, location into
+    # flowing prose — no bullet-point fragments.
+
+    if po_gp >= 3 and po_avg > 0:
+        baseline_clause = (
+            f"{pname} is averaging {po_avg:.1f} {stat_w} across {po_gp} playoff appearances"
+        )
+        if rs_avg > 0 and rs_gp >= 10:
+            baseline_clause += f", coming off a {rs_avg:.1f} regular-season baseline over {rs_gp} games"
+
+        trend_clause = ""
+        if l5_avg is not None and l5_avg > 0 and po_avg > 0:
+            pct_diff = (l5_avg - po_avg) / po_avg
+            if pct_diff > 0.15:
+                trend_clause = (
+                    f" His last five outings tell a sharper story — {l5_avg:.1f} per game, "
+                    f"running {abs(pct_diff)*100:.0f}% above his postseason norm and in the middle "
+                    f"of a genuine scoring run."
+                )
+            elif pct_diff > 0.05:
+                trend_clause = (
+                    f" The L5 average of {l5_avg:.1f} is trending in the right direction, "
+                    f"tracking above his playoff mean heading into this spot."
+                )
+            elif pct_diff < -0.15:
+                trend_clause = (
+                    f" The recent form is a concern — he's managed just {l5_avg:.1f} over the last five, "
+                    f"a {abs(pct_diff)*100:.0f}% dip from his postseason baseline that the model "
+                    f"is weighing against a potential snap-back."
+                )
+            elif pct_diff < -0.05:
+                trend_clause = (
+                    f" He's running slightly below his playoff average recently ({l5_avg:.1f} L5), "
+                    f"though the differential isn't alarming."
+                )
+            else:
+                trend_clause = (
+                    f" Recent form is consistent — his L5 of {l5_avg:.1f} tracks right alongside "
+                    f"his postseason average."
+                )
+
+        rest_clause = ""
+        if rest_days is not None:
+            if rest_days == 0:
+                rest_clause = " He's on a back-to-back tonight, a workload flag that historically compresses efficiency by a measurable margin."
+            elif rest_days >= 3:
+                rest_clause = f" Coming in with {rest_days} days' rest, he should be as fresh as any point in this series."
+            elif rest_days == 2:
+                rest_clause = " Operating on standard two-day rest — nothing to flag here."
+
+        location_clause = ""
+        if is_home is True:
+            location_clause = f" Playing at home gives {team} the crowd factor and familiar floor."
+        elif is_home is False:
+            location_clause = f" This is a road assignment — {team} will need to manufacture their own energy."
+
+        p2 = baseline_clause + "." + trend_clause + rest_clause + location_clause
+        paragraphs.append(p2.strip())
     elif l5_avg is not None and l5_avg > 0:
-        parts.append(f"posting {l5_avg:.1f} over his last 5 games")
-
-    if rest_days is not None:
+        rest_note = ""
         if rest_days == 0:
-            parts.append("playing the second leg of a back-to-back tonight, which historically compresses efficiency")
-        elif rest_days >= 3:
-            parts.append(f"coming in with {rest_days} days of rest — fresh legs heading into this one")
+            rest_note = " Back-to-back fatigue is a real consideration tonight."
+        elif rest_days is not None and rest_days >= 3:
+            rest_note = f" Notably fresh with {rest_days} days of rest."
+        loc_note = " Home crowd tonight." if is_home else (" Road assignment." if is_home is False else "")
+        paragraphs.append(
+            f"{pname} is posting {l5_avg:.1f} {stat_w} per game over his last five outings.{rest_note}{loc_note}"
+        )
 
-    if is_home is True:
-        parts.append("playing in front of the home crowd")
-    elif is_home is False:
-        parts.append("operating in a road environment")
-
-    if parts:
-        p2 = f"{pname} enters this contest " + ", ".join(parts[:3]) + "."
-        if len(parts) > 3:
-            p2 += " " + ", ".join(parts[3:]).capitalize() + "."
-        paragraphs.append(p2)
-
-    # ── P3: Matchup & key factor analysis ─────────────────────────────────────
-    matchup_parts = []
+    # ── P3: Matchup anatomy ───────────────────────────────────────────────────
+    # Build one cohesive paragraph that reads as matchup-specific analysis.
+    matchup_sentences = []
 
     if opp_def is not None:
-        if opp_def > 115:
-            matchup_parts.append(
-                f"{opp} has been one of the more permissive defensive units in this playoff field, "
-                f"surrendering {opp_def:.1f} points per 100 possessions on a rolling 10-game basis"
+        if opp_def > 116:
+            def_read = (
+                f"{opp_display} has been one of the most permissive units in the field defensively — "
+                f"surrendering {opp_def:.1f} points per 100 possessions on a rolling basis, "
+                f"a number that historically generates above-average stat ceilings for the opposition."
             )
-        elif opp_def < 108:
-            matchup_parts.append(
-                f"{opp} presents a genuinely stingy defensive assignment, "
-                f"holding opponents to just {opp_def:.1f} points per 100 possessions recently"
+        elif opp_def > 112:
+            def_read = (
+                f"{opp_display} is a below-average defensive team at {opp_def:.1f} points allowed per 100 "
+                f"possessions — not a sieve, but the kind of unit that gives offensive players room to operate."
+            )
+        elif opp_def < 107:
+            def_read = (
+                f"{opp_display} has been a legitimate elite-level defense, allowing just {opp_def:.1f} points "
+                f"per 100 possessions — the kind of assignment that compresses scoring floors "
+                f"and punishes anything but the most efficient shot diets."
+            )
+        elif opp_def < 110:
+            def_read = (
+                f"Defensively, {opp_display} is quality — {opp_def:.1f} points per 100 possessions puts "
+                f"them in the upper tier of teams {pname} has faced in this postseason."
             )
         else:
-            matchup_parts.append(
-                f"{opp} grades as a mid-tier defensive unit at {opp_def:.1f} points allowed per 100 possessions"
+            def_read = (
+                f"{opp_display} grades as a serviceable mid-tier defense at {opp_def:.1f} points "
+                f"per 100 possessions — nothing that creates a meaningful edge in either direction."
             )
+        matchup_sentences.append(def_read)
 
     if prop_type in _SCORING_PROPS:
-        if fg3_vs is not None and fg3_vs > 0.02:
-            matchup_parts.append(
-                f"their defense concedes above-average three-point attempt rates (+{fg3_vs*100:.1f}pp vs league avg), "
-                f"a favorable pattern for perimeter-oriented scorers"
+        shot_notes = []
+        if fg3_vs is not None and fg3_vs > 0.025:
+            shot_notes.append(
+                f"their defense bleeds three-point attempts at an above-average rate (+{fg3_vs*100:.1f}pp vs league), "
+                f"opening the arc for perimeter-oriented players"
             )
-        elif fg3_vs is not None and fg3_vs < -0.02:
-            matchup_parts.append(
-                f"the defense actively funnels opponents away from the arc ({fg3_vs*100:.1f}pp below league avg in 3PA rate), "
-                f"compressing the shot menu for three-point-reliant players"
+        elif fg3_vs is not None and fg3_vs < -0.025:
+            shot_notes.append(
+                f"they actively funnel opponents off the three-point line ({fg3_vs*100:.1f}pp below league in 3PA rate), "
+                f"narrowing the shot menu for jump-shot-heavy scorers"
             )
-        if rim_vs is not None and rim_vs > 0.02:
-            matchup_parts.append(
-                f"interior FG% allowed sits {rim_vs*100:.1f}pp above the league average, "
-                f"suggesting soft paint resistance that benefits drive-heavy scorers"
+        if rim_vs is not None and rim_vs > 0.025:
+            shot_notes.append(
+                f"interior FG% conceded is {rim_vs*100:.1f}pp above average — soft paint resistance "
+                f"that rewards drive-and-finish players"
             )
+        elif rim_vs is not None and rim_vs < -0.025:
+            shot_notes.append(
+                f"rim protection is a genuine strength, holding opponents {abs(rim_vs)*100:.1f}pp below average "
+                f"on interior looks"
+            )
+        if shot_notes:
+            matchup_sentences.append("Schematically, " + "; ".join(shot_notes) + ".")
 
     if opp_pace is not None:
-        _LEAGUE_AVG_PACE_NARR = 96.5
-        pace_delta = opp_pace - _LEAGUE_AVG_PACE_NARR
-        if pace_delta > 2.5:
-            matchup_parts.append(
-                f"the pace projection ({opp_pace:.1f} possessions) runs well above league average, "
-                f"inflating the raw counting-stat opportunity"
+        _LEAGUE_PACE = 96.5
+        delta_pace = opp_pace - _LEAGUE_PACE
+        if delta_pace > 3:
+            matchup_sentences.append(
+                f"The pace environment plays right into this prop — {opp_display} pushes the tempo "
+                f"at {opp_pace:.1f} possessions per game, well above league average and translating "
+                f"to more raw counting-stat opportunities across the board."
             )
-        elif pace_delta < -2.5:
-            matchup_parts.append(
-                f"the tempo ({opp_pace:.1f} possessions) skews slow, compressing the overall stat environment"
+        elif delta_pace < -3:
+            matchup_sentences.append(
+                f"Pace is a headwind here. {opp_display} plays at {opp_pace:.1f} possessions per game — "
+                f"a grind-it-out style that structurally compresses scoring volume for both teams."
             )
 
-    if inactive_usg_pool > 8:
-        matchup_parts.append(
-            f"a significant usage vacuum ({inactive_usg_pool:.1f} USG points removed from the rotation "
-            f"by tonight's absences) creates a direct volume opportunity for {pname}"
+    if inactive_usg_pool > 9:
+        matchup_sentences.append(
+            f"The injury report reshapes this game in a meaningful way — {inactive_usg_pool:.1f} usage "
+            f"points are coming out of the rotation, and the model distributes a significant share "
+            f"of that volume to {pname} as the primary beneficiary. This is the kind of usage vacuum "
+            f"that unlocks ceilings on {stat_w} props."
         )
-    elif inactive_usg_pool > 3:
-        matchup_parts.append(
-            f"teammate absences open a modest {inactive_usg_pool:.1f}-point usage window that should flow toward {pname}"
+    elif inactive_usg_pool > 4:
+        matchup_sentences.append(
+            f"Teammate absences inject incremental opportunity — {inactive_usg_pool:.1f} usage points "
+            f"freed up tonight, with the model routing a portion to {pname}."
         )
 
     if prop_type in ("assists", "pa", "pra", "ra") and inactive_potential_ast_pool > 4:
-        matchup_parts.append(
-            f"the creation void left by absent teammates "
-            f"({inactive_potential_ast_pool:.1f} potential assists per game removed) could elevate ball-handling responsibilities"
+        matchup_sentences.append(
+            f"The creation void from missing teammates ({inactive_potential_ast_pool:.1f} potential assists "
+            f"per game removed) could push more ball-handling and facilitation responsibilities onto {pname}, "
+            f"directly supporting the assist projection."
         )
 
-    if matchup_parts:
-        p3 = "On the matchup side, " + matchup_parts[0] + ". "
-        for part in matchup_parts[1:3]:
-            p3 += part.capitalize() + ". "
-        if len(matchup_parts) > 3:
-            p3 += matchup_parts[3].capitalize() + "."
-        paragraphs.append(p3.strip())
+    if matchup_sentences:
+        paragraphs.append(" ".join(matchup_sentences))
 
-    # ── P4: XGBoost / tracking context ───────────────────────────────────────
-    if xgb_used and feats:
-        xgb_base  = breakdown.get("xgb_base")
-        xgb_delta = breakdown.get("xgb_vs_heuristic_pct")   # e.g. +0.1 = +0.1% vs base
-        xpps = feats.get("xPPS_base")
-        eff_d = feats.get("efficiency_delta")
-        track_parts = []
+    # ── P4: Model signals + variance synthesis ────────────────────────────────
+    signal_parts = []
 
-        if xgb_base and xgb_delta is not None:
-            direction_w = "above" if xgb_delta >= 0 else "below"
-            track_parts.append(
-                f"The gradient-boosted model outputs {xgb_base:.1f} as its base estimate — "
-                f"{abs(xgb_delta):.1f}% {direction_w} the blended historical baseline"
+    # XGBoost tracking signal
+    if xgb_used and xpps is not None and eff_d is not None:
+        if eff_d > 0.03:
+            signal_parts.append(
+                f"Tracking data introduces a cautionary note — {pname} is shooting at a rate "
+                f"above his expected shot-quality baseline (efficiency delta: +{eff_d*100:.1f}pp vs xPPS), "
+                f"suggesting some portion of recent efficiency is unsustained and may mean-revert."
+            )
+        elif eff_d < -0.03:
+            signal_parts.append(
+                f"Tracking metrics are quietly bullish here. {pname}'s recent efficiency sits "
+                f"{abs(eff_d)*100:.1f}pp below his expected shot-quality baseline — "
+                f"the kind of suppressed-efficiency reading that typically precedes positive regression "
+                f"as shot selection normalizes."
+            )
+        elif xpps > 0.95:
+            signal_parts.append(
+                f"His shot diet is elite-level — an xPPS of {xpps:.3f} reflects a high-quality "
+                f"offensive mix of drive finishes, pull-ups, and catch-and-shoot looks."
             )
 
-        if xpps is not None and eff_d is not None:
-            xpps_pct = xpps * 100  # convert to percentage display
-            if eff_d > 0.02:
-                track_parts.append(
-                    f"tracking data shows {pname} shooting above his expected shot-quality baseline "
-                    f"(xPPS: {xpps:.3f}), indicating unsustained efficiency that may normalize"
-                )
-            elif eff_d < -0.02:
-                track_parts.append(
-                    f"recent efficiency sits below his underlying shot-quality baseline (xPPS: {xpps:.3f}), "
-                    f"flagging potential positive regression in the near term"
-                )
-
-        pot_ast = feats.get("l5_potential_ast")
-        if prop_type in ("assists", "pa", "pra", "ra") and pot_ast and pot_ast > 0:
-            track_parts.append(
-                f"passing tracking logs {pot_ast:.1f} potential assists per game — "
-                f"the key creation-volume input feeding the model's assist projection"
+    if prop_type in ("assists", "pa", "pra", "ra") and pot_ast and pot_ast > 0:
+        if pot_ast >= 5:
+            signal_parts.append(
+                f"Passing-tracking logs {pot_ast:.1f} potential assists per game — "
+                f"a genuine creation workload that gives the assist projection a strong volume floor."
             )
-
-        if track_parts:
-            paragraphs.append(" ".join(track_parts) + ".")
-
-    # ── P5: Variance & final synthesis ────────────────────────────────────────
-    risk_parts = []
-
-    if cb_floor is not None and cb_ceiling is not None:
-        risk_parts.append(f"the model's 68% probability range spans {cb_floor}–{cb_ceiling} {stat_w}")
-
-    if mc_over is not None and book_line:
-        mc_pct = round(mc_over * 100, 1) if over_lean else round((monte_carlo or {}).get("prob_under", 0) * 100, 1)
-        if mc_pct >= 60:
-            risk_parts.append(f"Monte Carlo simulation returns a {mc_pct}% hit-rate in the {lean_str} direction across 10,000 iterations")
-        elif mc_pct >= 50:
-            risk_parts.append(f"simulation returns a {mc_pct}% {lean_str} probability — a thin but positive expectation")
-
-    if trust >= 70:
-        risk_parts.append("the underlying L5 variance is controlled, supporting a clean look at this number")
-    elif trust >= 50:
-        risk_parts.append(f"the trust score of {trust}/100 reflects moderate variance — sizing down from max is prudent")
-    else:
-        risk_parts.append(f"the low trust score ({trust}/100) flags elevated game-to-game volatility; treat this as a small-unit play at best")
-
-    if risk_parts:
-        synth_intro = "All told, " if over_lean else "That said, "
-        p5 = synth_intro + "; ".join(risk_parts) + ". "
-        if edge_pct >= 5 and trust >= 60:
-            p5 += f"This projects as a quality {lean_str} play with both the model edge and variance profile aligned."
-        elif edge_pct >= 3 and trust >= 45:
-            p5 += f"A medium-unit {lean_str} lean is supported — edge exists but variance warrants measured sizing."
         else:
-            p5 += f"Edge exists but at least one signal is mixed — small unit only or pass."
-        paragraphs.append(p5)
+            signal_parts.append(
+                f"Potential assist tracking ({pot_ast:.1f}/game) provides the creation-volume signal "
+                f"anchoring the assist model."
+            )
+
+    # Confidence band + MC
+    if cb_floor is not None and cb_ceil is not None:
+        band_range = round(cb_ceil - cb_floor, 1)
+        if band_range <= 4:
+            signal_parts.append(
+                f"The model's 68% probability range — {cb_floor} to {cb_ceil} {stat_w} — "
+                f"is tight, indicating a controlled variance profile with limited downside risk."
+            )
+        elif band_range <= 7:
+            signal_parts.append(
+                f"The confidence band spans {cb_floor}–{cb_ceil} {stat_w}, "
+                f"a moderate range that reflects normal game-to-game variance for this player."
+            )
+        else:
+            signal_parts.append(
+                f"The {cb_floor}–{cb_ceil} {stat_w} range is wide — high-variance player profile "
+                f"means both the ceiling and floor are genuinely in play."
+            )
+
+    if mc_over is not None and book_line and book_line > 0:
+        sim_pct = round(mc_over * 100, 1) if over_lean else round((monte_carlo or {}).get("prob_under", 0.5) * 100, 1)
+        if sim_pct >= 63:
+            signal_parts.append(
+                f"Monte Carlo simulation backs the lean hard — {sim_pct}% of 10,000 iterations "
+                f"finish on the {lean_str} side, providing strong probabilistic confirmation."
+            )
+        elif sim_pct >= 55:
+            signal_parts.append(
+                f"Simulation logs a {sim_pct}% {lean_str} rate across 10,000 trials — "
+                f"a positive but not overwhelming probabilistic edge."
+            )
+        elif sim_pct < 50:
+            signal_parts.append(
+                f"The simulation is split on this one — only {sim_pct}% {lean_str} across 10,000 trials, "
+                f"a mild divergence from the EV model worth noting."
+            )
+
+    # Closing sizing recommendation
+    if edge_pct >= 5 and trust >= 65:
+        sizing = (
+            f"With the EV edge ({edge_pct}%), variance profile, and simulation all pointing the same direction, "
+            f"this is a full-unit {lean_str} play."
+        )
+    elif edge_pct >= 3 and trust >= 50:
+        sizing = (
+            f"A {edge_pct}% edge with a trust score of {trust}/100 supports a half-to-full unit "
+            f"{lean_str} — the model has conviction, but the variance doesn't justify overexposure."
+        )
+    elif book_line and book_line > 0:
+        sizing = (
+            f"The edge is real but thin at {edge_pct}% — this plays as a small-unit {lean_str} "
+            f"or a 'needs-a-look' prop rather than a core ticket."
+        )
+    else:
+        sizing = f"No line available to grade conviction — projection is {projection:.1f} {stat_w}."
+
+    signal_parts.append(sizing)
+
+    if signal_parts:
+        paragraphs.append(" ".join(signal_parts))
 
     full_text = "\n\n".join(paragraphs)
 
-    # Headline — one sentence
+    # ── Headline ──────────────────────────────────────────────────────────────
+    series_tag = f" [{series_str}]" if series_str else ""
     if book_line and book_line > 0:
         if edge_pct >= 5 and trust >= 65:
-            headline = f"{pname} {stat_w2.upper()} {lean_str} — High conviction ({edge_pct}% edge, trust {trust}/100)"
+            headline = f"{pname} {lean_str} {book_line} {stat_w.upper()} — High conviction ({edge_pct}% edge){series_tag}"
         elif edge_pct >= 2:
-            headline = f"{pname} {stat_w2.upper()} {lean_str} — Medium conviction ({edge_pct}% edge, trust {trust}/100)"
+            headline = f"{pname} {lean_str} {book_line} {stat_w.upper()} — Medium conviction ({edge_pct}% edge){series_tag}"
         else:
-            headline = f"{pname} {stat_w2.upper()} — Thin edge, WATCH ({edge_pct}% model gap, trust {trust}/100)"
+            headline = f"{pname} {stat_w.upper()} — Thin edge, {lean_str} {book_line} ({edge_pct}% gap){series_tag}"
     else:
-        headline = f"{pname} {stat_w2.upper()} — Projection {projection} (no live line)"
+        headline = f"{pname} {stat_w.upper()} — Projection {projection:.1f} (no live line){series_tag}"
 
     return {"headline": headline, "paragraphs": paragraphs, "full_text": full_text}
 
@@ -3344,15 +3461,23 @@ def post_project():
     if book_line and book_line > 0:
         book_gap = round(abs(corr - book_line) / book_line, 4)
 
-    # ── Game context (Vegas total + spread) ──────────────────────────────────
-    # Live from The Odds API, cached 600s. Not yet a training feature (needs
-    # historical odds data), but exposed in response for UI game context strip
-    # and stored in feats for future use when historical data is available.
+    # ── Game context (Vegas total + spread + playoff series) ─────────────────
     own_team_abbr = player.get("team", "").upper()
     game_ctx = {}
     if own_team_abbr and opp_abbr:
         try:
             game_ctx = _get_game_context(own_team_abbr, opp_abbr)
+        except Exception:
+            pass
+        # Enrich with playoff series state from ESPN schedule
+        try:
+            for _eg in _fetch_espn_games():
+                if {_eg.get("home", ""), _eg.get("away", "")} == {own_team_abbr, opp_abbr}:
+                    if _eg.get("series"):
+                        game_ctx["series"] = _eg["series"]
+                    if _eg.get("title"):
+                        game_ctx["game_title"] = _eg["title"]
+                    break
         except Exception:
             pass
 
