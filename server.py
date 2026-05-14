@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.26.3"  # fix: SSE retries players build on warmup cache-miss; client proceeds on warmupDone
+SERVER_VERSION = "v6.26.4"  # fix: unsupported odds markets return friendly 404 instead of 503
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2311,7 +2311,9 @@ def _fetch_odds_slate(market: str):
                     logging.warning("Odds API game %s %s: %s", ev['id'], market, o.status_code)
             except Exception as _ge:
                 logging.warning("Odds API game fetch: %s", _ge)
-        return games or None
+        # Return [] (not None) when API is reachable but market has no data.
+        # None is reserved for true connectivity/auth failures.
+        return games
     except Exception as exc:
         logging.warning("Odds API slate error: %s", exc)
         return None
@@ -2452,6 +2454,8 @@ def get_live_line(player_name, prop_key):
     slate = _fetch_odds_slate(market)
     if slate is None:
         return jsonify({"error": "odds service unavailable — check ODDS_API_KEY"}), 503
+    if slate == []:
+        return jsonify({"error": f"No line available for {prop_key.replace('_', ' ')} — enter manually"}), 404
 
     name_norm = player_name.lower().strip()
     lines = []
