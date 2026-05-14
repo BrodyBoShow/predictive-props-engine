@@ -29,7 +29,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 try:
-    from nba_api.stats.endpoints import leaguegamelog, leaguedashptstats
+    from nba_api.stats.endpoints import leaguegamelog, leaguedashptstats, leaguedashplayerstats
 except ImportError:
     print("Missing dependency — run: pip install nba_api pandas numpy pyarrow")
     sys.exit(1)
@@ -117,6 +117,34 @@ def _fetch_tracking_season(season: str, measure_type: str, retries: int = 3) -> 
     return pd.DataFrame()
 
 
+def _fetch_scoring_season(season: str, retries: int = 3) -> pd.DataFrame:
+    """Fetch full-season LeagueDashPlayerStats Scoring breakdown per player, with caching."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    fpath = os.path.join(CACHE_DIR, f"scoring_{season}.parquet")
+    if os.path.exists(fpath):
+        print(f"  cache hit  → {fpath}")
+        return pd.read_parquet(fpath)
+    for attempt in range(retries):
+        try:
+            time.sleep(SLEEP_SEC)
+            df = leaguedashplayerstats.LeagueDashPlayerStats(
+                season=season,
+                season_type_all_star="Regular Season",
+                per_mode_simple="PerGame",
+                measure_type_detailed_defense="Scoring",
+                timeout=90,
+            ).get_data_frames()[0]
+            df.to_parquet(fpath, index=False)
+            print(f"  fetched scoring {season}: {len(df)} players")
+            return df
+        except Exception as exc:
+            wait = 3 * (attempt + 1)
+            print(f"  attempt {attempt+1} failed ({exc}), retrying in {wait}s…")
+            time.sleep(wait)
+    print(f"  FAILED scoring {season}")
+    return pd.DataFrame()
+
+
 def _build_tracking_prior_lookup() -> dict:
     """
     Fetch prior-season full-season tracking for every training season and build
@@ -134,6 +162,7 @@ def _build_tracking_prior_lookup() -> dict:
         pullup_df  = _fetch_tracking_season(prior_season, "PullUpShot")
         cs_df      = _fetch_tracking_season(prior_season, "CatchShoot")
         passing_df = _fetch_tracking_season(prior_season, "Passing")
+        scoring_df = _fetch_scoring_season(prior_season)
 
         # Index each measure by PLAYER_ID
         def _idx(df):
@@ -145,8 +174,9 @@ def _build_tracking_prior_lookup() -> dict:
         pu_idx = _idx(pullup_df)
         cs_idx = _idx(cs_df)
         pa_idx = _idx(passing_df)
+        sc_idx = _idx(scoring_df)
 
-        all_pids = set(d_idx) | set(pu_idx) | set(cs_idx) | set(pa_idx)
+        all_pids = set(d_idx) | set(pu_idx) | set(cs_idx) | set(pa_idx) | set(sc_idx)
         lookup = {}
 
         for pid in all_pids:
@@ -154,6 +184,7 @@ def _build_tracking_prior_lookup() -> dict:
             pu = pu_idx.get(pid, {})
             c  = cs_idx.get(pid, {})
             pa = pa_idx.get(pid, {})
+            sc = sc_idx.get(pid, {})
 
             d_fga  = float(d.get("DRIVE_FGA",          0) or 0)
             pu_fga = float(pu.get("PULL_UP_FGA",        0) or 0)
@@ -178,10 +209,16 @@ def _build_tracking_prior_lookup() -> dict:
             potential_ast = float(pa.get("POTENTIAL_AST", 0) or 0) if pa else 0.0
             drive_pg      = d_fga  # drives per game ≈ drive FGA per game (best proxy available)
 
+            # Scoring breakdown — pct of points from paint / 3s (0–1 decimal from API)
+            pct_pts_paint = float(sc.get("PCT_PTS_PAINT", 0) or 0)
+            pct_pts_3pt   = float(sc.get("PCT_PTS_3PT",   0) or 0)
+
             lookup[int(pid)] = {
-                "xPPS_base":     xPPS,
-                "potentialAst":  potential_ast,
-                "drivePg":       drive_pg,
+                "xPPS_base":    xPPS,
+                "potentialAst": potential_ast,
+                "drivePg":      drive_pg,
+                "pctPtsPaint":  pct_pts_paint,
+                "pctPts3pt":    pct_pts_3pt,
             }
 
         tracking_prior[prior_season] = lookup
@@ -230,7 +267,9 @@ def _per_player(grp: pd.DataFrame) -> pd.DataFrame:
     grp = grp.sort_values("GAME_DATE").copy()
 
     # Rest days (capped at 14 — bye weeks, start of season get 7)
-    grp["rest_days"] = grp["GAME_DATE"].diff().dt.days.fillna(7).clip(upper=14)
+    grp["rest_days"]      = grp["GAME_DATE"].diff().dt.days.fillna(7).clip(upper=14)
+    grp["is_b2b"]         = (grp["rest_days"] == 0).astype(int)
+    grp["is_well_rested"] = (grp["rest_days"] >= 3).astype(int)
 
     # L5 rolling averages (prior games only — flat window)
     for col, feat in [
@@ -456,9 +495,11 @@ def main():
             return np.nan
         return entry.get(field)
 
-    raw["xPPS_base"]    = raw.apply(lambda r: _get_prior_tracking(r, "xPPS_base"),   axis=1)
-    raw["prior_pot_ast"]= raw.apply(lambda r: _get_prior_tracking(r, "potentialAst"), axis=1)
-    raw["prior_drives"] = raw.apply(lambda r: _get_prior_tracking(r, "drivePg"),      axis=1)
+    raw["xPPS_base"]     = raw.apply(lambda r: _get_prior_tracking(r, "xPPS_base"),    axis=1)
+    raw["prior_pot_ast"] = raw.apply(lambda r: _get_prior_tracking(r, "potentialAst"), axis=1)
+    raw["prior_drives"]  = raw.apply(lambda r: _get_prior_tracking(r, "drivePg"),      axis=1)
+    raw["pct_pts_paint"] = raw.apply(lambda r: _get_prior_tracking(r, "pctPtsPaint"),  axis=1).fillna(0.0)
+    raw["pct_pts_3pt"]   = raw.apply(lambda r: _get_prior_tracking(r, "pctPts3pt"),    axis=1).fillna(0.0)
 
     # efficiency_delta: player's recent TS% vs their prior-season shot-quality baseline.
     # At inference: server.py computes l5_ts - xPPS from live tracking (same definition).
@@ -510,6 +551,21 @@ def main():
     print(f"  inactive_drives_pool: mean={raw['inactive_drives_pool'].mean():.2f}  "
           f"non-zero={(raw['inactive_drives_pool'] > 0).mean():.1%}")
 
+    # ── 5d. Derived interaction features ─────────────────────────────────────
+    # leverage_index: regular season=0, playoffs=1 (G7 detection too sparse at 2 seasons)
+    raw["leverage_index"] = (raw["season_type"] == "Playoffs").astype(float)
+
+    # Stylistic matchup overlays: player shot-diet fraction × opponent zone concession
+    # A perimeter shooter facing a soft arc defense gets a large positive scalar;
+    # a post-up center in the same game gets near-zero — tree sees the interaction directly.
+    raw["paint_overlay"]     = raw["pct_pts_paint"] * raw["rim_vs_avg"].fillna(0.0)
+    raw["perimeter_overlay"] = raw["pct_pts_3pt"]   * raw["fg3_vs_avg"].fillna(0.0)
+
+    # Role-vacuum absorption overlays: player archetype rate × inactive teammate pool size
+    # Ensures a high-ast-rate guard absorbs a creation void far more than a spot-up shooter.
+    raw["creation_absorption"] = raw["prior_pot_ast"].fillna(0.0) * raw["inactive_potential_ast_pool"]
+    raw["slashing_absorption"] = raw["prior_drives"].fillna(0.0)  * raw["inactive_drives_pool"]
+
     # ── 6. Define targets ─────────────────────────────────────────────────────
     raw["target_pts"] = raw["PTS"]
     raw["target_reb"] = raw["REB"]
@@ -521,7 +577,7 @@ def main():
         "PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "GAME_ID", "GAME_DATE",
         "season", "season_type",
         # Pre-game features — flat windows
-        "is_home", "rest_days",
+        "is_home", "rest_days", "is_b2b", "is_well_rested",
         "l5_pts", "l5_reb", "l5_ast", "l5_min", "l5_ts",
         "l10_pts_std", "l10_min_std",
         "std_pts", "std_reb", "std_ast", "std_min",
@@ -538,6 +594,12 @@ def main():
         "xPPS_base",                       # prior-season shot-quality baseline
         "efficiency_delta",               # l5_ts - xPPS_base (regression signal)
         "l5_potential_ast",               # prior-season creation volume
+        # Context and interaction features
+        "leverage_index",                  # 0=RS, 1=playoffs
+        "paint_overlay",                   # pct_pts_paint × rim_vs_avg
+        "perimeter_overlay",               # pct_pts_3pt × fg3_vs_avg
+        "creation_absorption",             # prior_pot_ast × inactive_potential_ast_pool
+        "slashing_absorption",             # prior_drives × inactive_drives_pool
         # Targets
         "target_pts", "target_reb", "target_ast",
         # Keep actual MIN for analysis — NOT a training feature (future leakage)
@@ -556,7 +618,9 @@ def main():
                       "ewma_pts", "ewma_reb", "ewma_ast",
                       "inactive_usg_pool", "opp_def_roll10", "opp_pace_roll10",
                       "xPPS_base", "efficiency_delta", "l5_potential_ast",
-                      "inactive_potential_ast_pool", "inactive_drives_pool"]
+                      "inactive_potential_ast_pool", "inactive_drives_pool",
+                      "paint_overlay", "perimeter_overlay",
+                      "creation_absorption", "slashing_absorption"]
     print(out[[c for c in feat_cols_diag if c in out.columns]].isna().sum().to_string())
 
     out.to_parquet(OUTPUT_FILE, index=False)
@@ -568,6 +632,7 @@ def main():
         "l10_pts_std", "l10_min_std",
         "std_pts", "std_reb", "std_ast", "std_min",
         "gp_prior", "is_home", "rest_days",
+        "is_b2b", "is_well_rested",
         "opp_def_roll10", "opp_pace_roll10",
         "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
         "inactive_usg_pool",
@@ -580,6 +645,12 @@ def main():
         # Multi-dimensional inactive teammate pools
         "inactive_potential_ast_pool",
         "inactive_drives_pool",
+        # Context and interaction features
+        "leverage_index",
+        "paint_overlay",
+        "perimeter_overlay",
+        "creation_absorption",
+        "slashing_absorption",
     ]
     medians = {c: float(out[c].median()) for c in feature_cols if c in out.columns}
     meta = {"feature_cols": feature_cols, "medians": medians}

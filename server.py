@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.25.0"  # feat: FGM prop + splits/live-line — completes 3PA/FGA/2PA/FGM attempt-prop suite
+SERVER_VERSION = "v6.26.0"  # feat: 7 new ML interaction features — overlays, absorptions, rest flags, leverage
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1991,6 +1991,7 @@ def _build_xgb_features(
     inactive_potential_ast_pool: float = 0.0,
     inactive_drives_pool: float = 0.0,
     prop_type: str = "points",
+    high_leverage: bool = False,
 ) -> dict:
     """
     Assemble the feature vector matching the training pipeline columns.
@@ -2163,6 +2164,28 @@ def _build_xgb_features(
     if l5_potential_ast is None and l5_ast is not None:
         l5_potential_ast = round(float(l5_ast) * 3.33, 2)  # proxy fallback
 
+    # ── Binary rest flags ─────────────────────────────────────────────────────
+    is_b2b_v         = 1 if rest_days_v == 0 else 0
+    is_well_rested_v = 1 if rest_days_v >= 3 else 0
+
+    # ── leverage_index ────────────────────────────────────────────────────────
+    # 0.0=regular season, 1.0=playoffs, 2.0=elimination/Game 7
+    _today = datetime.now(timezone.utc)
+    _is_playoff_window = (_today.month == 4 and _today.day >= 15) or _today.month in (5, 6)
+    leverage_index_v = 2.0 if high_leverage else (1.0 if _is_playoff_window else 0.0)
+
+    # ── Stylistic matchup overlays ────────────────────────────────────────────
+    # scoring_row pct values stored as 0-100; divide to get 0-1 fraction
+    _pct_paint = float((scoring_row or {}).get("pctPtsPaint") or 0) / 100.0
+    _pct_3pt   = float((scoring_row or {}).get("pctPts3pt")   or 0) / 100.0
+    paint_overlay_v     = _pct_paint * feat_rim_vs_avg
+    perimeter_overlay_v = _pct_3pt   * feat_fg3_vs_avg
+
+    # ── Role-vacuum absorption overlays ──────────────────────────────────────
+    _drive_fga = float((tracking_row or {}).get("driveFga", 0) or 0)
+    creation_absorption_v = float(l5_potential_ast or 0.0) * float(inactive_potential_ast_pool)
+    slashing_absorption_v = _drive_fga * float(inactive_drives_pool)
+
     # ── Minutes sub-model override ────────────────────────────────────────────
     # Project tonight's minutes rather than using the flat historical L5 average.
     # Blowout risk (large spread) and pace effects are already encoded in the model.
@@ -2188,6 +2211,8 @@ def _build_xgb_features(
         "gp_prior":          gp_prior,
         "is_home":           is_home_v,
         "rest_days":         rest_days_v,
+        "is_b2b":            is_b2b_v,
+        "is_well_rested":    is_well_rested_v,
         "opp_def_roll10":    opp_def_roll10,
         "opp_pace_roll10":   opp_pace_roll10,
         # EWMA recency features
@@ -2210,6 +2235,12 @@ def _build_xgb_features(
         # Multi-dimensional inactive teammate pools
         "inactive_potential_ast_pool": float(inactive_potential_ast_pool),
         "inactive_drives_pool":        float(inactive_drives_pool),
+        # Context and interaction features
+        "leverage_index":          leverage_index_v,
+        "paint_overlay":           paint_overlay_v,
+        "perimeter_overlay":       perimeter_overlay_v,
+        "creation_absorption":     creation_absorption_v,
+        "slashing_absorption":     slashing_absorption_v,
         # Diagnostic — visible in xgb_features_debug
         "_proj_min":         projected_min,
         "_hist_min":         l5_min_v,
@@ -2586,6 +2617,7 @@ def post_project():
                 inactive_potential_ast_pool=_inactive_potential_ast_pool,
                 inactive_drives_pool=_inactive_drives_pool,
                 prop_type=prop_type,
+                high_leverage=high_leverage,
             )
             xgb_out = _xgb_predict(_xgb_prop_key, feats)
             if xgb_out is not None:

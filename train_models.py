@@ -51,6 +51,8 @@ FEATURE_COLS = [
     "l10_pts_std", "l10_min_std",
     "std_pts", "std_reb", "std_ast", "std_min",
     "gp_prior", "is_home", "rest_days",
+    # Binary rest-context flags (cleaner tree splits than raw rest_days alone)
+    "is_b2b", "is_well_rested",
     "opp_def_roll10", "opp_pace_roll10",
     # EWMA recency features (halflife=3 — recent games weighted 2× vs 3-games-ago)
     "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
@@ -69,6 +71,17 @@ FEATURE_COLS = [
     "l5_potential_ast",
     "inactive_potential_ast_pool",
     "inactive_drives_pool",
+    # Context and interaction features
+    # leverage_index:        0.0=RS, 1.0=playoffs (game stakes)
+    # paint_overlay:         pct_pts_paint × rim_vs_avg (interior archetype × interior defense)
+    # perimeter_overlay:     pct_pts_3pt × fg3_vs_avg (perimeter archetype × arc defense)
+    # creation_absorption:   prior_pot_ast × inactive_potential_ast_pool (who absorbs the creation void)
+    # slashing_absorption:   prior_drives × inactive_drives_pool (who absorbs the drive void)
+    "leverage_index",
+    "paint_overlay",
+    "perimeter_overlay",
+    "creation_absorption",
+    "slashing_absorption",
 ]
 
 TARGETS = {
