@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.26.1"  # fix: remove Ayo Dosunmu OUT override — cleared to play
+SERVER_VERSION = "v6.26.2"  # feat: SSE ready-stream endpoint — eliminates cold-start polling loop
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -4418,10 +4418,42 @@ def debug_teams():
 
 @app.route("/api/ready")
 def get_ready():
-    """Lightweight ping — returns {ready: true} once players cache is populated.
-    Frontend polls this cheaply before firing all 9 data fetches."""
+    """Lightweight poll fallback — returns current warmup state."""
     players_cached = _cache_get("players") is not None
-    return {"ready": players_cached, "warmupDone": _warmup_done.is_set()}
+    warmup_done    = _warmup_done.is_set()
+    return {"ready": players_cached, "warmupDone": warmup_done,
+            "failed": warmup_done and not players_cached}
+
+
+@app.route("/api/ready-stream")
+def ready_stream():
+    """SSE endpoint — client opens one connection; server pushes ready event when warm.
+    Eliminates the 20-request polling loop on cold start."""
+    def generate():
+        # Already warm — fire immediately
+        if _cache_get("players") is not None:
+            yield f"data: {json.dumps({'ready': True, 'warmupDone': True})}\n\n"
+            return
+        # Send a heartbeat every 10 s so the connection stays alive through proxies,
+        # then push the real event once warmup_done fires.
+        import time as _time
+        deadline = _time.monotonic() + 330  # 5.5 min max — matches client timeout
+        while _time.monotonic() < deadline:
+            done = _warmup_done.wait(timeout=10)
+            players_cached = _cache_get("players") is not None
+            if done or players_cached:
+                yield f"data: {json.dumps({'ready': players_cached, 'warmupDone': True})}\n\n"
+                return
+            # Heartbeat comment keeps connection alive
+            yield ": heartbeat\n\n"
+        # Timed out — tell client to fall back to direct fetch
+        yield f"data: {json.dumps({'ready': False, 'warmupDone': False, 'timeout': True})}\n\n"
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/api/cache-status")
