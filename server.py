@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.28.2"  # Manual odds cache skips empty/None; debug /api/odds-status endpoint
+SERVER_VERSION = "v6.28.3"  # Quota-exhausted sentinel + clear 503 message; odds-status endpoint
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2356,6 +2356,12 @@ def _fetch_odds_slate(market: str):
                 )
                 if o.ok:
                     games.append(o.json())
+                elif o.status_code in (401, 422, 429):
+                    # 401/422 = key invalid or quota exhausted; 429 = rate limited
+                    remaining = o.headers.get("x-requests-remaining", "?")
+                    logging.warning("Odds API quota/auth error market=%s: %s (remaining=%s)",
+                                    market, o.status_code, remaining)
+                    return "QUOTA_EXHAUSTED"  # sentinel — caller will 503 with clear message
                 else:
                     logging.warning("Odds API game %s market=%s: %s — %s",
                                     ev["id"], market, o.status_code, o.text[:80])
@@ -2381,7 +2387,7 @@ def _fetch_odds_slate(market: str):
     if hit is not None and now - hit["ts"] < _ODDS_SLATE_TTL:
         return hit["data"]
     result = _fetch_odds_slate_raw(market)
-    if result:  # only cache non-None, non-empty
+    if result and result != "QUOTA_EXHAUSTED":  # only cache real successful results
         _ODDS_SLATE_CACHE[market] = {"data": result, "ts": now}
     return result
 
@@ -2514,9 +2520,11 @@ def get_live_line(player_name, prop_key):
         return jsonify({"error": f"unsupported prop '{prop_key}'"}), 400
 
     slate = _fetch_odds_slate(market)
+    if slate == "QUOTA_EXHAUSTED":
+        return jsonify({"error": "Odds API quota exhausted — upgrade plan at the-odds-api.com or wait for monthly reset"}), 503
     if slate is None:
         return jsonify({"error": "odds service unavailable — check ODDS_API_KEY"}), 503
-    if slate == []:
+    if not slate:
         return jsonify({"error": f"No line available for {prop_key.replace('_', ' ')} — enter manually"}), 404
 
     name_norm = player_name.lower().strip()
