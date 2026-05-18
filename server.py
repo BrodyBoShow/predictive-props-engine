@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.27.2"  # Adj 3 continuous shot-diet×defense; Adj 5 USG-weighted pace; Adj 17 role volatility
+SERVER_VERSION = "v6.28.0"  # Combined-market odds fetch: all props in one call per game; fallback per-market if combined fails
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2294,18 +2294,34 @@ _ODDS_MARKET_MAP = {
 
 _PRIMARY_BOOKS = {"draftkings", "fanduel", "betmgm", "caesars"}
 
+# All markets we ever need — fetched together in one combined call per game
+_ALL_ODDS_MARKETS = ",".join([
+    "player_points", "player_rebounds", "player_assists",
+    "player_threes", "player_steals", "player_blocks",
+    "player_points_rebounds_assists", "player_points_assists",
+    "player_points_rebounds", "player_rebounds_assists",
+])
 
-def _fetch_odds_slate(market: str):
+# Combined slate cache — key: "all" → list-of-game-dicts with all markets merged
+_COMBINED_ODDS_CACHE = None
+if _ODDS_AVAILABLE:
+    from cachetools import TTLCache
+    _COMBINED_ODDS_CACHE = TTLCache(maxsize=4, ttl=600)
+
+
+def _fetch_combined_odds_slate():
     """
-    Pull the full NBA player-prop slate for one market string from The Odds API.
-    Wrapped in a TTLCache (10 min) so 100 player lookups cost ≤ (N_games + 1) API calls.
-    Returns list-of-game-dicts or None on any failure.
+    Fetch ALL player-prop markets in a single batch per game (one API call per event).
+    Returns list-of-game-dicts (bookmakers → markets combined), or None on failure.
+    Cached 10 min so all subsequent market lookups are free.
     """
+    if _COMBINED_ODDS_CACHE is not None and "all" in _COMBINED_ODDS_CACHE:
+        return _COMBINED_ODDS_CACHE["all"]
+
     api_key = os.environ.get("ODDS_API_KEY", "")
     if not api_key or not _ODDS_AVAILABLE:
         return None
     try:
-        # Step 1 — today's NBA events (event IDs required for player-prop endpoint)
         ev_resp = _requests_lib.get(
             "https://api.the-odds-api.com/v4/sports/basketball_nba/events",
             params={"apiKey": api_key},
@@ -2316,39 +2332,111 @@ def _fetch_odds_slate(market: str):
             return None
         events = ev_resp.json()
         if not events:
-            return []
+            result = []
+            if _COMBINED_ODDS_CACHE is not None:
+                _COMBINED_ODDS_CACHE["all"] = result
+            return result
 
-        # Step 2 — per-event player-prop odds (one call per game, cached together)
         games = []
         for ev in events[:12]:
             try:
                 o = _requests_lib.get(
                     f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{ev['id']}/odds",
                     params={
-                        "apiKey":      api_key,
-                        "regions":     "us",
-                        "markets":     market,
-                        "oddsFormat":  "american",
+                        "apiKey":     api_key,
+                        "regions":    "us",
+                        "markets":    _ALL_ODDS_MARKETS,
+                        "oddsFormat": "american",
                     },
                     timeout=10,
                 )
                 if o.ok:
                     games.append(o.json())
                 else:
-                    logging.warning("Odds API game %s %s: %s", ev['id'], market, o.status_code)
+                    logging.warning("Odds API game %s combined: %s — %s",
+                                    ev["id"], o.status_code, o.text[:120])
+                    # Fall back to per-market fetches for this game if combined fails
+                    game_fallback = _fetch_game_odds_fallback(ev["id"], api_key)
+                    if game_fallback:
+                        games.append(game_fallback)
             except Exception as _ge:
                 logging.warning("Odds API game fetch: %s", _ge)
-        # Return [] (not None) when API is reachable but market has no data.
-        # None is reserved for true connectivity/auth failures.
+
+        if _COMBINED_ODDS_CACHE is not None:
+            _COMBINED_ODDS_CACHE["all"] = games
         return games
     except Exception as exc:
         logging.warning("Odds API slate error: %s", exc)
         return None
 
 
-# Apply TTL cache only when cachetools is available
-if _ODDS_AVAILABLE:
-    _fetch_odds_slate = _ct_cached(_ODDS_CACHE)(_fetch_odds_slate)
+def _fetch_game_odds_fallback(event_id: str, api_key: str) -> dict | None:
+    """
+    Fallback: fetch markets one-by-one for a single game and merge bookmaker data.
+    Used only when the combined call fails (e.g. plan doesn't support multi-market).
+    """
+    _INDIVIDUAL_MARKETS = [
+        "player_points", "player_rebounds", "player_assists",
+        "player_threes", "player_steals", "player_blocks",
+    ]
+    merged_bookmakers: dict = {}  # key → book dict
+
+    for mkt in _INDIVIDUAL_MARKETS:
+        try:
+            r = _requests_lib.get(
+                f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds",
+                params={"apiKey": api_key, "regions": "us",
+                        "markets": mkt, "oddsFormat": "american"},
+                timeout=8,
+            )
+            if not r.ok:
+                continue
+            data = r.json()
+            for book in (data.get("bookmakers") or []):
+                bkey = book.get("key", "")
+                if bkey not in merged_bookmakers:
+                    merged_bookmakers[bkey] = {
+                        "key": bkey,
+                        "title": book.get("title", bkey),
+                        "markets": [],
+                    }
+                merged_bookmakers[bkey]["markets"].extend(book.get("markets") or [])
+            # Use first successful response as the base game dict
+            if merged_bookmakers and "id" not in locals().get("base", {}):
+                base = {k: v for k, v in data.items() if k != "bookmakers"}
+        except Exception:
+            pass
+
+    if not merged_bookmakers:
+        return None
+    base = base if "base" in dir() else {"id": event_id}  # type: ignore[name-defined]
+    base["bookmakers"] = list(merged_bookmakers.values())
+    return base
+
+
+def _fetch_odds_slate(market: str):
+    """
+    Return the cached combined slate filtered to a specific market string.
+    All markets are fetched together; this is just a view into the combined result.
+    Returns list-of-game-dicts or None on failure.
+    """
+    slate = _fetch_combined_odds_slate()
+    if slate is None:
+        return None
+    if not slate:
+        return []
+
+    # Filter each game's bookmakers to only include the requested market
+    filtered = []
+    for game in slate:
+        books_with_market = []
+        for book in (game.get("bookmakers") or []):
+            matching_mkts = [m for m in (book.get("markets") or []) if m.get("key") == market]
+            if matching_mkts:
+                books_with_market.append({**book, "markets": matching_mkts})
+        if books_with_market:
+            filtered.append({**game, "bookmakers": books_with_market})
+    return filtered
 
 
 # ── Game totals / spreads cache ───────────────────────────────────────────────
