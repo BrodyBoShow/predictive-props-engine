@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.28.1"  # Revert to per-market odds fetch; shared events cache saves quota; no empty-result caching
+SERVER_VERSION = "v6.28.2"  # Manual odds cache skips empty/None; debug /api/odds-status endpoint
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2361,15 +2361,29 @@ def _fetch_odds_slate(market: str):
                                     ev["id"], market, o.status_code, o.text[:80])
             except Exception as _ge:
                 logging.warning("Odds API game fetch: %s", _ge)
-        return games
+        return games if games else None
     except Exception as exc:
         logging.warning("Odds API slate error: %s", exc)
         return None
 
 
-# Apply TTL cache (10 min) per market string
-if _ODDS_AVAILABLE:
-    _fetch_odds_slate = _ct_cached(_ODDS_CACHE)(_fetch_odds_slate)
+# Manual TTL cache for odds slates — only stores non-None results so failures
+# don't poison the cache for 10 minutes.
+_ODDS_SLATE_CACHE: dict = {}   # market → {"data": [...], "ts": float}
+_ODDS_SLATE_TTL = 600.0
+
+_fetch_odds_slate_raw = _fetch_odds_slate
+
+def _fetch_odds_slate(market: str):
+    import time as _t
+    now = _t.time()
+    hit = _ODDS_SLATE_CACHE.get(market)
+    if hit is not None and now - hit["ts"] < _ODDS_SLATE_TTL:
+        return hit["data"]
+    result = _fetch_odds_slate_raw(market)
+    if result:  # only cache non-None, non-empty
+        _ODDS_SLATE_CACHE[market] = {"data": result, "ts": now}
+    return result
 
 
 # ── Game totals / spreads cache ───────────────────────────────────────────────
@@ -4507,6 +4521,42 @@ def get_injuries():
 @app.route("/api/version")
 def get_version():
     return {"version": SERVER_VERSION, "ready": _warmup_done.is_set()}
+
+
+@app.route("/api/odds-status")
+def get_odds_status():
+    """Diagnostic: check Odds API connectivity and quota without burning market calls."""
+    api_key = os.environ.get("ODDS_API_KEY", "")
+    if not api_key:
+        return jsonify({"error": "ODDS_API_KEY not set"}), 503
+    if not _ODDS_AVAILABLE:
+        return jsonify({"error": "requests/cachetools not installed"}), 503
+    try:
+        r = _requests_lib.get(
+            "https://api.the-odds-api.com/v4/sports/basketball_nba/events",
+            params={"apiKey": api_key},
+            timeout=10,
+        )
+        remaining = r.headers.get("x-requests-remaining", "unknown")
+        used      = r.headers.get("x-requests-used", "unknown")
+        if not r.ok:
+            return jsonify({
+                "status": "api_error",
+                "http_status": r.status_code,
+                "body": r.text[:300],
+                "quota_remaining": remaining,
+                "quota_used": used,
+            }), 200
+        events = r.json() or []
+        return jsonify({
+            "status": "ok",
+            "event_count": len(events),
+            "events": [{"id": e.get("id"), "home": e.get("home_team"), "away": e.get("away_team")} for e in events[:6]],
+            "quota_remaining": remaining,
+            "quota_used": used,
+        })
+    except Exception as exc:
+        return jsonify({"status": "exception", "error": str(exc)}), 200
 
 
 @app.route("/api/model-status")
