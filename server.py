@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.27.1"  # Adj 16 implied team total (live O/U); superlinear USG cascade; game_ctx pre-cascade
+SERVER_VERSION = "v6.27.2"  # Adj 3 continuous shot-diet×defense; Adj 5 USG-weighted pace; Adj 17 role volatility
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2913,34 +2913,45 @@ def post_project():
         corr = round(corr * (1.0 + def_composite_pct), 2)
 
         # ─────────────────────────────────────────────────────────────────────────
-        # ADJUSTMENT 3 — SHOT PROFILE ALIGNMENT
-        # Points props only. If player scores ≥35% of their pts from 3s AND
-        # the opponent's 3pt defense is elite (fg3VsAvg ≤ -1.5%), apply -1.0 pt.
-        # Inverse: if opponent leaks 3s (fg3VsAvg ≥ +1.5%), apply +0.5 pt bonus.
+        # ADJUSTMENT 3 — SHOT DIET × DEFENSIVE SPECIFICITY
+        # Continuous weighted interaction: player's actual shot-zone reliance ×
+        # the opponent's documented weakness/strength in that same zone.
+        # Replaces the old binary (fires-only-at-35%) version.
+        #
+        # Logic:
+        #   • fg3VsAvg (+) = opponent leaks 3s → 3PT-heavy player gets a boost
+        #   • rimVsAvg (+) = opponent leaks paint → paint-heavy player gets a boost
+        #   • Signals are weighted by the player's actual scoring % in each zone,
+        #     so a player who gets 60% of their pts from paint gets 3× more impact
+        #     from rim defense vs a player who only gets 20% from paint.
+        # Cap: ±8% (wider than binary because it's personalized to the shot diet).
         # ─────────────────────────────────────────────────────────────────────────
-        shot_delta = 0.0
-        if prop_type in ("points", "pra", "pr") and scoring_row and opp_def:
-            pct_3pt     = float(scoring_row.get("pctPts3pt") or 0)
-            fg3_vs_avg  = float(opp_def.get("fg3VsAvg") or 0)
-            is_3pt_guy  = pct_3pt >= _THREE_PT_RELY_THRESH
-            elite_def   = fg3_vs_avg <= _FG3_ELITE_DEF_THRESH
-            weak_def    = fg3_vs_avg >= 0.015
-            if is_3pt_guy and elite_def:
-                shot_delta = -1.0
+        _SHOT_DIET_CAP = 0.08
+        shot_delta_pct = 0.0
+        if prop_type in ("points", "pra", "pa") and scoring_row and opp_def:
+            pct_3pt_frac   = float(scoring_row.get("pctPts3pt")   or 0) / 100.0
+            pct_paint_frac = float(scoring_row.get("pctPtsPaint") or 0) / 100.0
+            fg3_va = float(opp_def.get("fg3VsAvg") or 0)
+            rim_va = float(opp_def.get("rimVsAvg")  or 0)
+            # Normalize each defensive signal to ±1 range (typical observed ranges):
+            # fg3VsAvg ≈ ±0.025, rimVsAvg ≈ ±0.04
+            _3pt_norm  = fg3_va  / 0.025
+            _paint_norm = rim_va / 0.040
+            # Weighted combination: player's reliance × opponent gap
+            _combined = (pct_3pt_frac * _3pt_norm * 0.55
+                       + pct_paint_frac * _paint_norm * 0.45)
+            shot_delta_pct = _soft_cap(_combined * 0.09, _SHOT_DIET_CAP)
+            if abs(shot_delta_pct) >= 0.005:
+                _shot_abs = round(corr * shot_delta_pct, 2)
+                _dir = "BOOST" if shot_delta_pct > 0 else "MISMATCH"
                 drivers.append(
-                    f"Shot Profile MISMATCH — {resolved_name.title()} derives "
-                    f"{pct_3pt:.0f}% of pts from 3s, but {opp_abbr} is an elite "
-                    f"3pt defense ({fg3_vs_avg:+.1%} vs league avg). Penalty: −1.0 pt."
+                    f"Shot Diet × Defense {_dir} — {resolved_name.title()} scores "
+                    f"{pct_3pt_frac*100:.0f}% from 3s / {pct_paint_frac*100:.0f}% from paint. "
+                    f"{opp_abbr}: fg3VsAvg {fg3_va:+.3f}, rimVsAvg {rim_va:+.3f}. "
+                    f"Weighted impact: {shot_delta_pct*100:+.1f}% ({_shot_abs:+.2f})."
                 )
-            elif is_3pt_guy and weak_def:
-                shot_delta = +0.5
-                drivers.append(
-                    f"Shot Profile BOOST — {resolved_name.title()} derives "
-                    f"{pct_3pt:.0f}% of pts from 3s and {opp_abbr} leaks threes "
-                    f"({fg3_vs_avg:+.1%} vs league avg). Bonus: +0.5 pts."
-                )
-        breakdown["shotProfileAdj"] = shot_delta
-        corr = round(corr + shot_delta, 2)
+        breakdown["shotProfileAdj"] = round(shot_delta_pct * 100, 2)
+        corr = round(corr * (1 + shot_delta_pct), 2)
 
         # ─────────────────────────────────────────────────────────────────────────
         # ADJUSTMENT 3b — SHOT VOLUME OPPONENT ALIGNMENT (attempt props only)
@@ -3026,15 +3037,20 @@ def post_project():
             own_pace = float(own_team_data.get("rsPace") or 0)
             opp_pace = float(opp_team_data.get("rsPace") or 0)
             if own_pace > 50 and opp_pace > 50:
-                game_pace = round((own_pace + opp_pace) / 2, 1)
-                delta_pct = (game_pace - _LEAGUE_AVG_PACE) / _LEAGUE_AVG_PACE
-                pace_pct  = _soft_cap(delta_pct, _PACE_CAP)   # sigmoid, was hard ±5%
+                game_pace  = round((own_pace + opp_pace) / 2, 1)
+                delta_pct  = (game_pace - _LEAGUE_AVG_PACE) / _LEAGUE_AVG_PACE
+                # USG-weighted pace: high-usage players benefit more from extra possessions
+                # because the additional shots route disproportionately to the primary creator.
+                # Scale: 20% USG = 1.0×, 30% USG = 1.5×, 15% USG = 0.75×. Cap multiplier at 1.6.
+                _usg_v     = float(po.get("usg") or rs.get("usg") or 20.0)
+                _usg_scale = min(1.6, _usg_v / 20.0)
+                pace_pct   = _soft_cap(delta_pct * _usg_scale, _PACE_CAP)
                 if abs(pace_pct) >= 0.005:
                     tempo = "FAST" if delta_pct > 0 else "SLOW"
                     pace_abs = round(corr * pace_pct, 2)
                     drivers.append(
-                        f"Pace Context — {tempo} game expected ({game_pace} possessions/48 vs "
-                        f"{_LEAGUE_AVG_PACE} league avg). Each possession = scoring opportunity. "
+                        f"Pace × Usage — {tempo} game ({game_pace} possessions/48 vs "
+                        f"{_LEAGUE_AVG_PACE} avg). USG {_usg_v:.0f}% weight ×{_usg_scale:.2f}. "
                         f"Impact: {pace_pct*100:+.1f}% ({pace_abs:+.2f})."
                     )
         elif use_rate_base and prop_type in _COUNTING_PROPS:
@@ -3544,6 +3560,45 @@ def post_project():
                 )
     breakdown["impliedTotalAdj"] = round(implied_total_pct * 100, 2)
     corr = round(corr * (1 + implied_total_pct), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 17 — ROLE VOLATILITY (L5 stat coefficient of variation)
+    # A player with high L5 variance on this specific prop has an unpredictable
+    # role — wide outcome distribution → harder to clear any given line.
+    # Regress the projection slightly toward the book line for volatile roles.
+    #
+    # Signal: CV = std(L5) / mean(L5) from the l5_stat_values game log.
+    # Threshold: CV > 0.35 triggers regression. At CV=0.60 → max -5% penalty.
+    # Does NOT fire when: XGBoost active (encodes variance via l10_pts_std),
+    # or fewer than 3 L5 values available, or non-counting props.
+    # ─────────────────────────────────────────────────────────────────────────
+    _ROLE_VOL_THRESH = 0.35
+    _ROLE_VOL_CAP    = 0.05
+    role_vol_pct     = 0.0
+    if (not _xgb_used and prop_type in _COUNTING_PROPS
+            and l5_stat_values and len(l5_stat_values) >= 3):
+        try:
+            _rv_vals = [float(v) for v in l5_stat_values if v is not None]
+            if len(_rv_vals) >= 3 and sum(_rv_vals) > 0:
+                _rv_mean = sum(_rv_vals) / len(_rv_vals)
+                _rv_std  = (sum((v - _rv_mean) ** 2 for v in _rv_vals) / len(_rv_vals)) ** 0.5
+                _rv_cv   = _rv_std / max(_rv_mean, 0.1)
+                if _rv_cv > _ROLE_VOL_THRESH:
+                    # Linear ramp: 0% at CV=0.35, -5% at CV=0.85+
+                    raw_pct = -min(1.0, (_rv_cv - _ROLE_VOL_THRESH) / 0.50) * _ROLE_VOL_CAP
+                    role_vol_pct = _soft_cap(raw_pct, _ROLE_VOL_CAP)
+                    if abs(role_vol_pct) >= 0.005:
+                        _rv_abs = round(corr * role_vol_pct, 2)
+                        drivers.append(
+                            f"Role Volatility — L5 {prop_type} CV {_rv_cv:.2f} "
+                            f"(std {_rv_std:.1f} / mean {_rv_mean:.1f}). "
+                            f"High variance role → regression toward line: "
+                            f"{role_vol_pct*100:+.1f}% ({_rv_abs:+.2f})."
+                        )
+        except Exception:
+            pass
+    breakdown["roleVolAdj"] = round(role_vol_pct * 100, 2)
+    corr = round(corr * (1 + role_vol_pct), 2)
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 14 — RESIDUAL CALIBRATION (model learns from historical errors)
