@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.27.0"  # L5 weight 0.35→0.20; minutes gate for streak variance; matchup/pace caps widened
+SERVER_VERSION = "v6.27.1"  # Adj 16 implied team total (live O/U); superlinear USG cascade; game_ctx pre-cascade
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2595,6 +2595,26 @@ def post_project():
     own_team_data = teams_cache.get(own_team, {}) if own_team else {}
     opp_team_data = teams_cache.get(opp_abbr, {}) if opp_abbr else {}
 
+    # ── Game context (Vegas total + spread + playoff series) — built early ─────
+    # Must precede cascade so Adj 16 (implied team total) can use live O/U data.
+    own_team_abbr = player.get("team", "").upper()
+    game_ctx = {}
+    if own_team_abbr and opp_abbr:
+        try:
+            game_ctx = _get_game_context(own_team_abbr, opp_abbr)
+        except Exception:
+            pass
+        try:
+            for _eg in _fetch_espn_games():
+                if {_eg.get("home", ""), _eg.get("away", "")} == {own_team_abbr, opp_abbr}:
+                    if _eg.get("series"):
+                        game_ctx["series"] = _eg["series"]
+                    if _eg.get("title"):
+                        game_ctx["game_title"] = _eg["title"]
+                    break
+        except Exception:
+            pass
+
     # ── Base projection — Rate×Minutes with dynamic sample-size weights ───────
     base, use_rate_base = _base_stat(
         po, rs, prop_type, scoring_row,
@@ -3425,18 +3445,30 @@ def post_project():
             pool     = remaining_usg + my_usg
             if my_usg > 0 and pool > 0:
                 freed    = sum(p[stat_lbl] for p in teammates_out)
-                share    = my_usg / pool
+                # Superlinear USG share: high-usage players absorb disproportionately
+                # more freed usage than a flat proportional split suggests, because
+                # coaches route extra possessions to their best creators first.
+                # usg² weighting captures this — a 30% USG player absorbs ~2x more
+                # than a 15% USG player, not just 2x proportionally.
+                my_usg_sq      = my_usg ** 1.5
+                pool_usg_sq    = sum(
+                    (float(tdata.get("po", {}).get("usg") or tdata.get("rs", {}).get("usg") or 0) ** 1.5)
+                    for tname, tdata in (_cache_get("players") or {}).get("players", {}).items()
+                    if tdata.get("team") == own_team and tname != resolved_name
+                    and not (effective_inj_map.get(tname) or {}).get("status", "").lower().startswith("out")
+                ) + my_usg_sq
+                share    = my_usg_sq / pool_usg_sq if pool_usg_sq > 0 else my_usg / pool
                 boost    = freed * share
                 my_stat  = float(po.get(my_stat_key) or rs.get(my_stat_key) or 1)
                 raw_pct  = boost / max(my_stat, 1)
-                inj_cascade_pct = max(0.0, _soft_cap(raw_pct, 0.20))  # sigmoid, bumped to +20% (was 0.15) — sportsbooks slow on DNPs
+                inj_cascade_pct = max(0.0, _soft_cap(raw_pct, 0.25))  # cap raised to 25% — DNP info is structural
                 if inj_cascade_pct >= 0.01:
                     boost_abs = round(corr * inj_cascade_pct, 2)
                     out_names = ", ".join(p["name"].title() for p in teammates_out[:3])
                     drivers.append(
                         f"Injury Cascade — {out_names} OUT ({freed:.1f} freed {stat_lbl}). "
                         f"{resolved_name.title()} absorbs ~{share*100:.0f}% of load "
-                        f"(USG {my_usg:.0f}%). Boost: {inj_cascade_pct*100:+.1f}% ({boost_abs:+.2f})."
+                        f"(USG {my_usg:.0f}%, superlinear weighting). Boost: {inj_cascade_pct*100:+.1f}% ({boost_abs:+.2f})."
                     )
     breakdown["injCascadeAdj"] = round(inj_cascade_pct * 100, 2)
     corr = round(corr * (1 + inj_cascade_pct), 2)
@@ -3474,6 +3506,44 @@ def post_project():
                     )
     breakdown["blowoutAdj"] = round(blowout_pct * 100, 2)
     corr = round(corr * (1 + blowout_pct), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 16 — IMPLIED TEAM TOTAL (live Vegas O/U signal)
+    # Source: Odds API game total + spread (already cached in game_ctx).
+    # High team-implied pts = favorable offensive environment for all counting stats.
+    # Formula: player_team_implied = (total - spread) / 2  (spread from team's POV:
+    #   negative = team favored → higher implied).
+    # Compare to league-average 114 PPG to size the environment shift.
+    # Only runs on counting stats; skipped when XGBoost active (XGB encodes pace).
+    # Cap: ±7% — structural environment signal, not a per-shot edge.
+    # ─────────────────────────────────────────────────────────────────────────
+    _IMPLIED_TOTAL_CAP   = 0.07
+    _LEAGUE_AVG_TEAM_PPG = 114.0
+    implied_total_pct    = 0.0
+    if (prop_type in _COUNTING_PROPS
+            and not _xgb_used
+            and game_ctx):
+        _gt = game_ctx.get("total")
+        _sp = game_ctx.get("spread")   # negative = player's team favored
+        if _gt is not None and _gt > 0:
+            _sp_v  = float(_sp) if _sp is not None else 0.0
+            # Player's team implied = (total - spread) / 2
+            # (spread already flipped to player's POV in _get_game_context)
+            _team_implied = (_gt - _sp_v) / 2.0
+            _env_delta    = (_team_implied - _LEAGUE_AVG_TEAM_PPG) / _LEAGUE_AVG_TEAM_PPG
+            # Attenuate: player captures ~70% of the team environment shift
+            implied_total_pct = _soft_cap(_env_delta * 0.70, _IMPLIED_TOTAL_CAP)
+            if abs(implied_total_pct) >= 0.005:
+                _impl_abs = round(corr * implied_total_pct, 2)
+                _env_dir  = "elevated" if _env_delta > 0 else "suppressed"
+                drivers.append(
+                    f"Implied Team Total — {own_team} implied {_team_implied:.1f} pts "
+                    f"(game O/U {_gt}, spread {_sp_v:+.1f}). Scoring environment "
+                    f"{_env_dir} vs league avg {_LEAGUE_AVG_TEAM_PPG:.0f}. "
+                    f"Counting stat impact: {implied_total_pct*100:+.1f}% ({_impl_abs:+.2f})."
+                )
+    breakdown["impliedTotalAdj"] = round(implied_total_pct * 100, 2)
+    corr = round(corr * (1 + implied_total_pct), 2)
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 14 — RESIDUAL CALIBRATION (model learns from historical errors)
@@ -3656,26 +3726,7 @@ def post_project():
     book_gap = None
     if book_line and book_line > 0:
         book_gap = round(abs(corr - book_line) / book_line, 4)
-
-    # ── Game context (Vegas total + spread + playoff series) ─────────────────
-    own_team_abbr = player.get("team", "").upper()
-    game_ctx = {}
-    if own_team_abbr and opp_abbr:
-        try:
-            game_ctx = _get_game_context(own_team_abbr, opp_abbr)
-        except Exception:
-            pass
-        # Enrich with playoff series state from ESPN schedule
-        try:
-            for _eg in _fetch_espn_games():
-                if {_eg.get("home", ""), _eg.get("away", "")} == {own_team_abbr, opp_abbr}:
-                    if _eg.get("series"):
-                        game_ctx["series"] = _eg["series"]
-                    if _eg.get("title"):
-                        game_ctx["game_title"] = _eg["title"]
-                    break
-        except Exception:
-            pass
+    # game_ctx already built above (before cascade) — no rebuild needed here
 
     try:
         analyst_narrative = _generate_analyst_narrative(
