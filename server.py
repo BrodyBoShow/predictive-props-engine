@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.26.6"  # fix: filter phantom ESPN conditional G6/G7 slots when series already concluded
+SERVER_VERSION = "v6.27.0"  # L5 weight 0.35→0.20; minutes gate for streak variance; matchup/pace caps widened
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1045,9 +1045,9 @@ _SHOT_QUAL_CAP_XGB          = 0.015  # ±1.5% cap when XGBoost is active (inform
 _THREE_PT_RELY_THRESH  = 35.0   # % pts from 3s = "3pt-reliant" shooter
 _FG3_ELITE_DEF_THRESH  = -0.015 # fg3VsAvg ≤ this → elite 3pt defense
 _MATCHUP_SCALE         = 0.015  # +1.5% projection per +1.0 dEFF point increase
-_MATCHUP_CAP           = 0.09   # ±9% max matchup delta swing
+_MATCHUP_CAP           = 0.12   # ±12% max matchup delta swing (was 0.09 — context matters more)
 _LEAGUE_AVG_PACE       = 96.5   # league-avg PO pace (possessions per 48 min)
-_PACE_CAP              = 0.05   # ±5% max pace adjustment
+_PACE_CAP              = 0.07   # ±7% max pace adjustment (was 0.05)
 _FORM_BLEND_WEIGHT     = 0.25   # how much L5 divergence counts vs base
 _FORM_CAP              = 0.08   # ±8% max recent form swing
 _REST_B2B              = -0.03  # 0 days rest = -3% counting stats
@@ -1510,15 +1510,16 @@ def _dynamic_weights(po_gp: int, rs_gp: int, has_l5: bool) -> tuple:
     Design goals:
       • PO weight grows as log(po_gp): more playoff evidence → trust it more
       • RS weight diluted by PO growth but FLOORED at 5% to prevent instability
-      • L5 stays fixed at 35% when available (highest predictive value for recent form)
+      • L5 fixed at 20% when available (reduced from 35% — prevents chasing streak
+        variance; matchup/context adjustments carry more relative weight now)
 
     Returns (po_weight, rs_weight, l5_weight)  — always sum to 1.0.
 
     Sample walk-through (with L5):
-      po_gp=3  → (0.25, 0.40, 0.35)  — early, RS anchors
-      po_gp=6  → (0.35, 0.30, 0.35)  — PO earning its weight
-      po_gp=12 → (0.46, 0.19, 0.35)  — PO dominant
-      po_gp=21 → (0.50, 0.15, 0.35)  — max PO, RS floored
+      po_gp=3  → (0.30, 0.50, 0.20)  — early, RS anchors
+      po_gp=6  → (0.42, 0.38, 0.20)  — PO earning its weight
+      po_gp=12 → (0.54, 0.26, 0.20)  — PO dominant
+      po_gp=21 → (0.58, 0.22, 0.20)  — max PO, RS floored
     """
     if po_gp < 3 or rs_gp < 5:
         # Insufficient PO sample — PO-only or RS-only
@@ -1527,9 +1528,12 @@ def _dynamic_weights(po_gp: int, rs_gp: int, has_l5: bool) -> tuple:
         return (0.0, 1.0, 0.0)
 
     if has_l5:
-        L5_W = 0.35
-        # PO: log-scale anchored at 0.25 when gp=3, caps at 0.50 around gp=21
-        po_raw = min(0.50, 0.25 * math.log1p(po_gp) / math.log1p(3))
+        # L5 reduced from 0.35 → 0.20: prevents chasing shooting variance;
+        # matchup/context adjustments (Adj 3–6) now carry more relative weight.
+        L5_W = 0.20
+        # PO: log-scale anchored at 0.30 when gp=3, caps at 0.58 around gp=21
+        # (cap raised slightly to absorb the freed L5 weight)
+        po_raw = min(0.58, 0.30 * math.log1p(po_gp) / math.log1p(3))
         rs_w = max(0.05, 1.0 - L5_W - po_raw)
         po_w = 1.0 - L5_W - rs_w
         return (round(po_w, 4), round(rs_w, 4), L5_W)
@@ -1850,6 +1854,19 @@ def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
                     has_l5_min = True
             except (TypeError, ValueError):
                 pass
+
+        # ── Minutes gate: distinguish role-change from shooting variance ─────
+        # If the L5 per-minute RATE is elevated but minutes are flat, the player
+        # is just shooting hot — not in an expanded role. Regress l5_pm back toward
+        # the PO baseline to avoid inflating projections off streak variance.
+        # Only fires when: rate spike ≥ 20% AND minutes NOT up ≥ 8%.
+        if has_l5_min and l5_pm is not None and po_pm > 0:
+            rate_spike = l5_pm / po_pm           # how much hotter L5 rate is vs PO
+            min_spike  = l5_min_f / po_min if po_min > 0 else 1.0
+            if rate_spike > 1.20 and min_spike < 1.08:
+                # Hot streak without a minutes bump → likely variance, not a role change.
+                # Regress 55% back toward PO baseline; keep 45% of the L5 signal.
+                l5_pm = po_pm * 0.55 + l5_pm * 0.45
 
         # Blended per-minute rate
         if has_l5_min and l5_pm is not None and l5_w > 0:
@@ -3054,7 +3071,7 @@ def post_project():
                                 f"Recent Form — {resolved_name.title()} {trend} over L5 "
                                 f"({l5:.1f} vs {season_blend:.1f} season blend, "
                                 f"{divergence*100:+.1f}%). Already blended into base "
-                                f"projection (L5 = 35% weight)."
+                                f"projection (L5 = 20% weight)."
                             )
             except (TypeError, ValueError):
                 pass
