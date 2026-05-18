@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.29.0"  # /api/live-lines-bulk: one HTTP call, combined-markets per game, 15-min cache
+SERVER_VERSION = "v6.29.1"  # Per-(market,game) cache: subset re-fetches cost 0; only new markets burn quota
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2561,27 +2561,51 @@ def get_live_line(player_name, prop_key):
     })
 
 
-# ── Combined-markets slate cache ──────────────────────────────────────────────
-# Key: frozenset of market strings → {data: list[game_dict], ts: float, remaining: str}
-# 15-min TTL (longer than per-market cache since this is the high-traffic path)
-_COMBO_SLATE_CACHE: dict = {}
-_COMBO_SLATE_TTL = 900.0
+# ── Per-(market, game_id) cache ───────────────────────────────────────────────
+# Each market×game pair is cached independently so any subset request can be
+# served from cache without re-fetching markets that are already warm.
+# Cache value: {"game": {...game dict with bookmakers→markets filtered to this market}, "ts": float}
+_MG_CACHE: dict = {}                 # (market, game_id) → {"game": dict, "ts": float}
+_MG_CACHE_TTL = 1800.0               # 30 min — lines barely move pre-game
+_QUOTA_REMAINING_LAST = "?"          # most recent header from any API call
+
+
+def _split_game_by_market(game_dict: dict) -> dict:
+    """Given one game-odds response with N markets in bookmakers, return
+    {market_key: game_dict_filtered_to_that_market}."""
+    out: dict = {}
+    base = {k: v for k, v in game_dict.items() if k != "bookmakers"}
+    for book in (game_dict.get("bookmakers") or []):
+        for mkt in (book.get("markets") or []):
+            mkey = mkt.get("key")
+            if not mkey:
+                continue
+            g = out.setdefault(mkey, {**base, "bookmakers": []})
+            # Find or create this book inside the per-market game dict
+            book_entry = None
+            for b in g["bookmakers"]:
+                if b.get("key") == book.get("key"):
+                    book_entry = b
+                    break
+            if book_entry is None:
+                book_entry = {"key": book.get("key"), "title": book.get("title"), "markets": []}
+                g["bookmakers"].append(book_entry)
+            book_entry["markets"].append(mkt)
+    return out
 
 
 def _fetch_combined_slate(market_keys: tuple):
     """
-    Fetch a comma-separated combined markets call per game. ONE HTTP call per
-    game pulls all requested markets at once. Quota cost is the same as N
-    individual calls but eliminates per-market round trips and lets us share
-    the events list across markets in a single function call.
-    Returns list-of-game-dicts, "QUOTA_EXHAUSTED", or None.
+    For each requested market × game, serve from per-(market, game) cache when
+    fresh; otherwise group cache misses per game and make ONE combined-markets
+    API call per game with only the missing markets.
+
+    Returns ([game_dicts_with_all_requested_markets_assembled], remaining_quota_str)
+    or ("QUOTA_EXHAUSTED", remaining) or (None, remaining).
     """
     import time as _t
-    cache_key = frozenset(market_keys)
+    global _QUOTA_REMAINING_LAST
     now = _t.time()
-    hit = _COMBO_SLATE_CACHE.get(cache_key)
-    if hit is not None and now - hit["ts"] < _COMBO_SLATE_TTL:
-        return hit["data"], hit.get("remaining", "?")
 
     api_key = os.environ.get("ODDS_API_KEY", "")
     if not api_key or not _ODDS_AVAILABLE:
@@ -2589,17 +2613,30 @@ def _fetch_combined_slate(market_keys: tuple):
 
     events = _get_nba_events(api_key)
     if events is None:
-        return None, "?"
+        return None, _QUOTA_REMAINING_LAST
     if not events:
-        return [], "?"
+        return [], _QUOTA_REMAINING_LAST
 
-    markets_csv = ",".join(market_keys)
-    games = []
-    remaining = "?"
+    # Determine which (market, game_id) pairs need fetching
+    missing_by_game: dict = {}    # game_id → list of markets to fetch
+    cached_by_game: dict = {}     # game_id → {market: game_dict_for_that_market}
+    ev_index = {ev["id"]: ev for ev in events[:12]}
+
     for ev in events[:12]:
+        gid = ev["id"]
+        for mk in market_keys:
+            hit = _MG_CACHE.get((mk, gid))
+            if hit is not None and now - hit["ts"] < _MG_CACHE_TTL:
+                cached_by_game.setdefault(gid, {})[mk] = hit["game"]
+            else:
+                missing_by_game.setdefault(gid, []).append(mk)
+
+    # Fetch only the cache misses, one HTTP call per game with combined markets
+    for gid, missing_markets in missing_by_game.items():
+        markets_csv = ",".join(missing_markets)
         try:
             o = _requests_lib.get(
-                f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{ev['id']}/odds",
+                f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{gid}/odds",
                 params={
                     "apiKey":     api_key,
                     "regions":    "us",
@@ -2608,22 +2645,57 @@ def _fetch_combined_slate(market_keys: tuple):
                 },
                 timeout=10,
             )
-            remaining = o.headers.get("x-requests-remaining", remaining)
+            _QUOTA_REMAINING_LAST = o.headers.get("x-requests-remaining", _QUOTA_REMAINING_LAST)
             if o.ok:
-                games.append(o.json())
+                game_data = o.json()
+                # Split per-market and cache each independently
+                per_mkt = _split_game_by_market(game_data)
+                for mk in missing_markets:
+                    if mk in per_mkt:
+                        _MG_CACHE[(mk, gid)] = {"game": per_mkt[mk], "ts": now}
+                        cached_by_game.setdefault(gid, {})[mk] = per_mkt[mk]
+                    else:
+                        # Market was requested but API returned no data for it.
+                        # Cache an empty entry so we don't keep retrying.
+                        empty = {k: v for k, v in game_data.items() if k != "bookmakers"}
+                        empty["bookmakers"] = []
+                        _MG_CACHE[(mk, gid)] = {"game": empty, "ts": now}
+                        cached_by_game.setdefault(gid, {})[mk] = empty
             elif o.status_code in (401, 422, 429):
-                logging.warning("Odds combo quota/auth %s: %s (remaining=%s)",
-                                o.status_code, o.text[:80], remaining)
-                return "QUOTA_EXHAUSTED", remaining
+                logging.warning("Odds quota/auth %s: %s (remaining=%s)",
+                                o.status_code, o.text[:80], _QUOTA_REMAINING_LAST)
+                return "QUOTA_EXHAUSTED", _QUOTA_REMAINING_LAST
             else:
-                logging.warning("Odds combo game %s: %s — %s",
-                                ev["id"], o.status_code, o.text[:80])
+                logging.warning("Odds game %s missing=%s: %s — %s",
+                                gid, missing_markets, o.status_code, o.text[:80])
         except Exception as exc:
-            logging.warning("Odds combo fetch error: %s", exc)
+            logging.warning("Odds fetch error: %s", exc)
 
-    if games:
-        _COMBO_SLATE_CACHE[cache_key] = {"data": games, "ts": now, "remaining": remaining}
-    return (games if games else None), remaining
+    # Assemble final result: one game_dict per game with all requested markets merged
+    final_games = []
+    for ev in events[:12]:
+        gid = ev["id"]
+        per_mkt = cached_by_game.get(gid, {})
+        if not per_mkt:
+            continue
+        # Pick any per_mkt entry's base fields, then merge bookmakers from all
+        first_g = next(iter(per_mkt.values()))
+        merged = {k: v for k, v in first_g.items() if k != "bookmakers"}
+        books_by_key: dict = {}
+        for mk in market_keys:
+            g = per_mkt.get(mk)
+            if not g:
+                continue
+            for b in (g.get("bookmakers") or []):
+                bkey = b.get("key")
+                if bkey not in books_by_key:
+                    books_by_key[bkey] = {"key": bkey, "title": b.get("title"), "markets": []}
+                books_by_key[bkey]["markets"].extend(b.get("markets") or [])
+        if books_by_key:
+            merged["bookmakers"] = list(books_by_key.values())
+            final_games.append(merged)
+
+    return (final_games if final_games else None), _QUOTA_REMAINING_LAST
 
 
 @app.route("/api/live-lines-bulk", methods=["POST"])
