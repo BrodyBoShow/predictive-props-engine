@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.28.3"  # Quota-exhausted sentinel + clear 503 message; odds-status endpoint
+SERVER_VERSION = "v6.29.0"  # /api/live-lines-bulk: one HTTP call, combined-markets per game, 15-min cache
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2558,6 +2558,151 @@ def get_live_line(player_name, prop_key):
         "prop":           prop_key,
         "consensus_line": consensus,
         "books_tracked":  len(lines),
+    })
+
+
+# ── Combined-markets slate cache ──────────────────────────────────────────────
+# Key: frozenset of market strings → {data: list[game_dict], ts: float, remaining: str}
+# 15-min TTL (longer than per-market cache since this is the high-traffic path)
+_COMBO_SLATE_CACHE: dict = {}
+_COMBO_SLATE_TTL = 900.0
+
+
+def _fetch_combined_slate(market_keys: tuple):
+    """
+    Fetch a comma-separated combined markets call per game. ONE HTTP call per
+    game pulls all requested markets at once. Quota cost is the same as N
+    individual calls but eliminates per-market round trips and lets us share
+    the events list across markets in a single function call.
+    Returns list-of-game-dicts, "QUOTA_EXHAUSTED", or None.
+    """
+    import time as _t
+    cache_key = frozenset(market_keys)
+    now = _t.time()
+    hit = _COMBO_SLATE_CACHE.get(cache_key)
+    if hit is not None and now - hit["ts"] < _COMBO_SLATE_TTL:
+        return hit["data"], hit.get("remaining", "?")
+
+    api_key = os.environ.get("ODDS_API_KEY", "")
+    if not api_key or not _ODDS_AVAILABLE:
+        return None, "?"
+
+    events = _get_nba_events(api_key)
+    if events is None:
+        return None, "?"
+    if not events:
+        return [], "?"
+
+    markets_csv = ",".join(market_keys)
+    games = []
+    remaining = "?"
+    for ev in events[:12]:
+        try:
+            o = _requests_lib.get(
+                f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{ev['id']}/odds",
+                params={
+                    "apiKey":     api_key,
+                    "regions":    "us",
+                    "markets":    markets_csv,
+                    "oddsFormat": "american",
+                },
+                timeout=10,
+            )
+            remaining = o.headers.get("x-requests-remaining", remaining)
+            if o.ok:
+                games.append(o.json())
+            elif o.status_code in (401, 422, 429):
+                logging.warning("Odds combo quota/auth %s: %s (remaining=%s)",
+                                o.status_code, o.text[:80], remaining)
+                return "QUOTA_EXHAUSTED", remaining
+            else:
+                logging.warning("Odds combo game %s: %s — %s",
+                                ev["id"], o.status_code, o.text[:80])
+        except Exception as exc:
+            logging.warning("Odds combo fetch error: %s", exc)
+
+    if games:
+        _COMBO_SLATE_CACHE[cache_key] = {"data": games, "ts": now, "remaining": remaining}
+    return (games if games else None), remaining
+
+
+@app.route("/api/live-lines-bulk", methods=["POST"])
+def post_live_lines_bulk():
+    """
+    Single-call bulk fetch for the Pull Live Lines button.
+    Body: {"players": ["lebron james", ...], "props": ["points","rebounds","assists"]}
+    Returns: {"lines": {player_lower: {prop_key: consensus_line}}, "quota_remaining": "...", "filled": N, "missing": N}
+    Server makes one combined-markets API call per game (not per player × per market).
+    """
+    body = request.get_json(silent=True) or {}
+    players = [str(p or "").lower().strip() for p in (body.get("players") or [])]
+    props   = [str(p or "").lower().strip() for p in (body.get("props")   or [])]
+    players = [p for p in players if p]
+    props   = [p for p in props if p]
+    if not players or not props:
+        return jsonify({"error": "players and props required"}), 400
+
+    # Resolve prop keys → Odds API market strings
+    market_pairs = [(p, _ODDS_MARKET_MAP.get(p)) for p in props]
+    valid = [(p, m) for p, m in market_pairs if m]
+    if not valid:
+        return jsonify({"error": "no supported props"}), 400
+    markets = tuple(sorted({m for _, m in valid}))
+
+    slate, remaining = _fetch_combined_slate(markets)
+    if slate == "QUOTA_EXHAUSTED":
+        return jsonify({"error": "Odds API quota exhausted — upgrade plan at the-odds-api.com or wait for monthly reset",
+                        "quota_remaining": remaining}), 503
+    if slate is None:
+        return jsonify({"error": "odds service unavailable", "quota_remaining": remaining}), 503
+
+    # Build market_key → prop_key reverse map for output
+    market_to_prop = {m: p for p, m in valid}
+    player_set = set(players)
+
+    # Iterate slate once and collect lines per (player, market)
+    # collected[player_lower][market] = list of book point values
+    collected: dict = {}
+    for game in (slate or []):
+        for book in (game.get("bookmakers") or []):
+            bkey = (book.get("key") or "").lower()
+            primary = bkey in _PRIMARY_BOOKS
+            for mkt in (book.get("markets") or []):
+                mkey = mkt.get("key")
+                if mkey not in market_to_prop:
+                    continue
+                for outcome in (mkt.get("outcomes") or []):
+                    desc = (outcome.get("description") or outcome.get("name") or "").lower().strip()
+                    if desc in player_set and (outcome.get("name") or "").lower() in ("over", "under"):
+                        pt = outcome.get("point")
+                        if pt is not None:
+                            collected.setdefault(desc, {}).setdefault(mkey, {"primary": [], "any": []})
+                            collected[desc][mkey]["any"].append(float(pt))
+                            if primary:
+                                collected[desc][mkey]["primary"].append(float(pt))
+
+    out: dict = {}
+    filled = 0
+    for pl in players:
+        per_prop = {}
+        pdata = collected.get(pl, {})
+        for mkey, prop_key in market_to_prop.items():
+            buckets = pdata.get(mkey)
+            if not buckets:
+                continue
+            arr = buckets["primary"] or buckets["any"]
+            if arr:
+                per_prop[prop_key] = statistics.median(arr)
+                filled += 1
+        if per_prop:
+            out[pl] = per_prop
+
+    expected = len(players) * len(valid)
+    return jsonify({
+        "lines":           out,
+        "filled":          filled,
+        "missing":         expected - filled,
+        "quota_remaining": remaining,
     })
 
 
